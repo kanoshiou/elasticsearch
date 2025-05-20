@@ -1,0 +1,26 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="elasticsearch [&quot;single_node.EsqlSpecIT CsvTests&quot;]" type="GradleRunConfiguration" factoryName="Gradle" folderName="check">
+    <ExternalSystemSettings>
+      <option name="executionName" />
+      <option name="externalProjectPath" value="$PROJECT_DIR$" />
+      <option name="externalSystemIdString" value="GRADLE" />
+      <option name="scriptParameters" value="-Dtests.method=&quot;test {*.* SYNC}&quot;" />
+      <option name="taskDescriptions">
+        <list />
+      </option>
+      <option name="taskNames">
+        <list>
+          <option value="&quot;:x-pack:plugin:esql:qa:server:single-node:javaRestTest&quot;" />
+          <option value="--tests" />
+          <option value="&quot;org.elasticsearch.xpack.esql.qa.single_node.EsqlSpecIT&quot;" />
+        </list>
+      </option>
+      <option name="vmOptions" />
+    </ExternalSystemSettings>
+    <ExternalSystemDebugServerProcess>true</ExternalSystemDebugServerProcess>
+    <ExternalSystemReattachDebugProcess>true</ExternalSystemReattachDebugProcess>
+    <DebugAllEnabled>false</DebugAllEnabled>
+    <RunAsTest>false</RunAsTest>
+    <method v="2" />
+  </configuration>
+</component>
