@@ -6,8 +6,11 @@
  */
 package org.elasticsearch.xpack.security.authz;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.AliasesRequest;
 import org.elasticsearch.action.IndicesRequest;
+import org.elasticsearch.action.ResolvedIndexExpressions;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
 import org.elasticsearch.action.admin.indices.alias.get.GetAliasesRequest;
 import org.elasticsearch.action.admin.indices.mapping.put.PutMappingRequest;
@@ -15,24 +18,26 @@ import org.elasticsearch.action.search.SearchContextId;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.support.IndexComponentSelector;
 import org.elasticsearch.action.support.IndicesOptions;
+import org.elasticsearch.action.support.UnsupportedSelectorException;
 import org.elasticsearch.cluster.metadata.AliasMetadata;
 import org.elasticsearch.cluster.metadata.IndexAbstraction;
 import org.elasticsearch.cluster.metadata.IndexAbstractionResolver;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
-import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.regex.Regex;
-import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexNotFoundException;
+import org.elasticsearch.search.crossproject.CrossProjectModeDecider;
+import org.elasticsearch.search.crossproject.TargetProjects;
+import org.elasticsearch.transport.LinkedProjectConfig;
+import org.elasticsearch.transport.LinkedProjectConfigService;
 import org.elasticsearch.transport.NoSuchRemoteClusterException;
 import org.elasticsearch.transport.RemoteClusterAware;
-import org.elasticsearch.transport.RemoteConnectionStrategy;
 import org.elasticsearch.transport.TransportRequest;
 import org.elasticsearch.xpack.core.security.authz.AuthorizationEngine;
 import org.elasticsearch.xpack.core.security.authz.IndicesAndAliasesResolverField;
@@ -48,21 +53,31 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.function.Predicate;
-import java.util.function.Supplier;
+import java.util.function.BiPredicate;
 
+import static org.elasticsearch.cluster.metadata.IndexNameExpressionResolver.isNoneExpression;
+import static org.elasticsearch.search.crossproject.CrossProjectIndexResolutionValidator.indicesOptionsForCrossProjectFanout;
 import static org.elasticsearch.xpack.core.security.authz.IndicesAndAliasesResolverField.NO_INDEX_PLACEHOLDER;
 
 class IndicesAndAliasesResolver {
 
+    private static final Logger logger = LogManager.getLogger(IndicesAndAliasesResolver.class);
+
     private final IndexNameExpressionResolver nameExpressionResolver;
     private final IndexAbstractionResolver indexAbstractionResolver;
     private final RemoteClusterResolver remoteClusterResolver;
+    private final CrossProjectModeDecider crossProjectModeDecider;
 
-    IndicesAndAliasesResolver(Settings settings, ClusterService clusterService, IndexNameExpressionResolver resolver) {
+    IndicesAndAliasesResolver(
+        Settings settings,
+        LinkedProjectConfigService linkedProjectConfigService,
+        IndexNameExpressionResolver resolver,
+        CrossProjectModeDecider crossProjectModeDecider
+    ) {
         this.nameExpressionResolver = resolver;
         this.indexAbstractionResolver = new IndexAbstractionResolver(resolver);
-        this.remoteClusterResolver = new RemoteClusterResolver(settings, clusterService.getClusterSettings());
+        this.remoteClusterResolver = new RemoteClusterResolver(settings, linkedProjectConfigService);
+        this.crossProjectModeDecider = crossProjectModeDecider;
     }
 
     /**
@@ -103,12 +118,12 @@ class IndicesAndAliasesResolver {
      * resolving wildcards.
      * </p>
      */
-
     ResolvedIndices resolve(
         String action,
         TransportRequest request,
         ProjectMetadata projectMetadata,
-        AuthorizationEngine.AuthorizedIndices authorizedIndices
+        AuthorizationEngine.AuthorizedIndices authorizedIndices,
+        TargetProjects authorizedProjects
     ) {
         if (request instanceof IndicesAliasesRequest indicesAliasesRequest) {
             ResolvedIndices.Builder resolvedIndicesBuilder = new ResolvedIndices.Builder();
@@ -124,7 +139,7 @@ class IndicesAndAliasesResolver {
         if (request instanceof IndicesRequest == false) {
             throw new IllegalStateException("Request [" + request + "] is not an Indices request, but should be.");
         }
-        return resolveIndicesAndAliases(action, (IndicesRequest) request, projectMetadata, authorizedIndices);
+        return resolveIndicesAndAliases(action, (IndicesRequest) request, projectMetadata, authorizedIndices, authorizedProjects);
     }
 
     /**
@@ -143,6 +158,10 @@ class IndicesAndAliasesResolver {
         }
         // It's safe to cast IndicesRequest since the above test guarantees it
         return resolveIndicesAndAliasesWithoutWildcards(action, indicesRequest);
+    }
+
+    boolean resolvesCrossProject(TransportRequest request) {
+        return request instanceof IndicesRequest.Replaceable replaceable && crossProjectModeDecider.resolvesCrossProject(replaceable);
     }
 
     private static boolean requiresWildcardExpansion(IndicesRequest indicesRequest) {
@@ -277,6 +296,16 @@ class IndicesAndAliasesResolver {
         ProjectMetadata projectMetadata,
         AuthorizationEngine.AuthorizedIndices authorizedIndices
     ) {
+        return resolveIndicesAndAliases(action, indicesRequest, projectMetadata, authorizedIndices, TargetProjects.NOT_CROSS_PROJECT);
+    }
+
+    ResolvedIndices resolveIndicesAndAliases(
+        String action,
+        IndicesRequest indicesRequest,
+        ProjectMetadata projectMetadata,
+        AuthorizationEngine.AuthorizedIndices authorizedIndices,
+        TargetProjects authorizedProjects
+    ) {
         final ResolvedIndices.Builder resolvedIndicesBuilder = new ResolvedIndices.Builder();
         boolean indicesReplacedWithNoIndices = false;
         if (indicesRequest instanceof PutMappingRequest && ((PutMappingRequest) indicesRequest).getConcreteIndex() != null) {
@@ -316,14 +345,12 @@ class IndicesAndAliasesResolver {
                 // First, if a selector is present, check to make sure that selectors are even allowed here
                 if (indicesOptions.allowSelectors() == false && allIndicesPatternSelector != null) {
                     String originalIndexExpression = indicesRequest.indices()[0];
-                    throw new IllegalArgumentException(
-                        "Index component selectors are not supported in this context but found selector in expression ["
-                            + originalIndexExpression
-                            + "]"
-                    );
+                    throw new UnsupportedSelectorException(originalIndexExpression);
                 }
                 if (indicesOptions.expandWildcardExpressions()) {
-                    for (String authorizedIndex : authorizedIndices.all().get()) {
+                    // TODO implement CPS index rewriting for all-indices requests
+                    IndexComponentSelector selector = IndexComponentSelector.getByKeyOrThrow(allIndicesPatternSelector);
+                    for (String authorizedIndex : authorizedIndices.all(selector)) {
                         if (IndexAbstractionResolver.isIndexVisible(
                             "*",
                             allIndicesPatternSelector,
@@ -342,31 +369,59 @@ class IndicesAndAliasesResolver {
                 // if we cannot replace wildcards the indices list stays empty. Same if there are no authorized indices.
                 // we honour allow_no_indices like es core does.
             } else {
-                final ResolvedIndices split;
-                if (replaceable.allowsRemoteIndices()) {
-                    split = remoteClusterResolver.splitLocalAndRemoteIndexNames(indicesRequest.indices());
-                } else {
-                    split = new ResolvedIndices(Arrays.asList(indicesRequest.indices()), Collections.emptyList());
-                }
-                List<String> replaced = indexAbstractionResolver.resolveIndexAbstractions(
-                    split.getLocal(),
-                    indicesOptions,
-                    projectMetadata,
-                    authorizedIndices.all(),
-                    authorizedIndices::check,
-                    indicesRequest.includeDataStreams()
-                );
-                resolvedIndicesBuilder.addLocal(replaced);
-                resolvedIndicesBuilder.addRemote(split.getRemote());
-            }
+                assert indicesRequest.indices() != null : "indices() cannot be null when resolving non-all-index expressions";
+                if (crossProjectModeDecider.resolvesCrossProject(replaceable)
+                    // a none expression should not go through cross-project resolution -- fall back to local resolution logic
+                    && false == IndexNameExpressionResolver.isNoneExpression(replaceable.indices())) {
+                    assert replaceable.allowsRemoteIndices() : "cross-project requests must allow remote indices";
+                    assert authorizedProjects.crossProject() : "cross-project requests must have cross-project target set";
 
+                    final ResolvedIndexExpressions resolved = indexAbstractionResolver.resolveIndexAbstractions(
+                        Arrays.asList(replaceable.indices()),
+                        indicesOptionsForCrossProjectFanout(indicesOptions),
+                        projectMetadata,
+                        authorizedIndices::all,
+                        authorizedIndices::check,
+                        authorizedProjects,
+                        indicesRequest.includeDataStreams()
+                    );
+                    setResolvedIndexExpressionsIfUnset(replaceable, resolved);
+                    resolvedIndicesBuilder.addLocal(resolved.getLocalIndicesList());
+                    resolvedIndicesBuilder.addRemote(resolved.getRemoteIndicesList());
+                } else {
+                    final ResolvedIndices split;
+                    if (replaceable.allowsRemoteIndices()) {
+                        split = remoteClusterResolver.splitLocalAndRemoteIndexNames(indicesRequest.indices());
+                    } else {
+                        split = new ResolvedIndices(Arrays.asList(indicesRequest.indices()), Collections.emptyList());
+                    }
+                    final ResolvedIndexExpressions resolved = indexAbstractionResolver.resolveIndexAbstractions(
+                        split.getLocal(),
+                        indicesOptions,
+                        projectMetadata,
+                        authorizedIndices::all,
+                        authorizedIndices::check,
+                        indicesRequest.includeDataStreams()
+                    );
+                    // only store resolved expressions if configured, to avoid unnecessary memory usage
+                    // once we've migrated from `indices()` to using resolved expressions holistically,
+                    // we will always store them
+                    if (crossProjectModeDecider.crossProjectEnabled()) {
+                        setResolvedIndexExpressionsIfUnset(replaceable, resolved);
+                    }
+                    resolvedIndicesBuilder.addLocal(resolved.getLocalIndicesList());
+                    resolvedIndicesBuilder.addRemote(split.getRemote());
+                }
+            }
             if (resolvedIndicesBuilder.isEmpty()) {
-                if (indicesOptions.allowNoIndices()) {
+                // if we resolved the request according to CPS rules, error handling (like throwing IndexNotFoundException) happens later
+                // therefore, don't throw here
+                if (indicesOptions.allowNoIndices() || crossProjectModeDecider.resolvesCrossProject(replaceable)) {
+                    indicesReplacedWithNoIndices = true;
                     // this is how we tell es core to return an empty response, we can let the request through being sure
                     // that the '-*' wildcard expression will be resolved to no indices. We can't let empty indices through
                     // as that would be resolved to _all by es core.
                     replaceable.indices(IndicesAndAliasesResolverField.NO_INDICES_OR_ALIASES_ARRAY);
-                    indicesReplacedWithNoIndices = true;
                     resolvedIndicesBuilder.addLocal(NO_INDEX_PLACEHOLDER);
                 } else {
                     throw new IndexNotFoundException(Arrays.toString(indicesRequest.indices()));
@@ -389,7 +444,7 @@ class IndicesAndAliasesResolver {
             if (aliasesRequest.expandAliasesWildcards()) {
                 List<String> aliases = replaceWildcardsWithAuthorizedAliases(
                     aliasesRequest.aliases(),
-                    loadAuthorizedAliases(authorizedIndices.all(), projectMetadata)
+                    loadAuthorizedAliases(authorizedIndices, projectMetadata)
                 );
                 aliasesRequest.replaceAliases(aliases.toArray(new String[aliases.size()]));
             }
@@ -425,14 +480,37 @@ class IndicesAndAliasesResolver {
         return resolvedIndicesBuilder.build();
     }
 
+    private static void setResolvedIndexExpressionsIfUnset(IndicesRequest.Replaceable replaceable, ResolvedIndexExpressions resolved) {
+        if (replaceable.getResolvedIndexExpressions() == null) {
+            replaceable.setResolvedIndexExpressions(resolved);
+        } else {
+            // see https://github.com/elastic/elasticsearch/issues/135799
+            String message = "resolved index expressions are already set to ["
+                + replaceable.getResolvedIndexExpressions()
+                + "] and should not be set again. Attempted to set to new expressions ["
+                + resolved
+                + "] for ["
+                + replaceable.getClass().getName()
+                + "]";
+            logger.debug(message);
+            // we are excepting `*,-*` below since we've observed this already -- keeping this assertion to catch other cases
+            assert replaceable.indices() == null || isNoneExpression(replaceable.indices()) : message;
+        }
+    }
+
     /**
      * Special handling of the value to authorize for a put mapping request. Dynamic put mapping
      * requests use a concrete index, but we allow permissions to be defined on aliases so if the
      * request's concrete index is not in the list of authorized indices, then we need to look to
      * see if this can be authorized against an alias
      */
-    static String getPutMappingIndexOrAlias(PutMappingRequest request, Predicate<String> isAuthorized, ProjectMetadata projectMetadata) {
+    static String getPutMappingIndexOrAlias(
+        PutMappingRequest request,
+        BiPredicate<String, IndexComponentSelector> isAuthorized,
+        ProjectMetadata projectMetadata
+    ) {
         final String concreteIndexName = request.getConcreteIndex().getName();
+        assert IndexNameExpressionResolver.hasSelectorSuffix(concreteIndexName) == false : "selectors are not allowed in this context";
 
         // validate that the concrete index exists, otherwise there is no remapping that we could do
         final IndexAbstraction indexAbstraction = projectMetadata.getIndicesLookup().get(concreteIndexName);
@@ -447,7 +525,8 @@ class IndicesAndAliasesResolver {
                     + indexAbstraction.getType().getDisplayName()
                     + "], but a concrete index is expected"
             );
-        } else if (isAuthorized.test(concreteIndexName)) {
+            // we know this is implicit data access (as opposed to another selector) so the default selector check is correct
+        } else if (isAuthorized.test(concreteIndexName, IndexComponentSelector.DATA)) {
             // user is authorized to put mappings for this index
             resolvedAliasOrIndex = concreteIndexName;
         } else {
@@ -456,7 +535,12 @@ class IndicesAndAliasesResolver {
             Map<String, List<AliasMetadata>> foundAliases = projectMetadata.findAllAliases(new String[] { concreteIndexName });
             List<AliasMetadata> aliasMetadata = foundAliases.get(concreteIndexName);
             if (aliasMetadata != null) {
-                Optional<String> foundAlias = aliasMetadata.stream().map(AliasMetadata::alias).filter(isAuthorized).filter(aliasName -> {
+                Optional<String> foundAlias = aliasMetadata.stream().map(AliasMetadata::alias).filter(aliasName -> {
+                    // we know this is implicit data access (as opposed to another selector) so the default selector check is correct
+                    assert IndexNameExpressionResolver.hasSelectorSuffix(aliasName) == false : "selectors are not allowed in this context";
+                    if (false == isAuthorized.test(aliasName, IndexComponentSelector.DATA)) {
+                        return false;
+                    }
                     IndexAbstraction alias = projectMetadata.getIndicesLookup().get(aliasName);
                     List<Index> indices = alias.getIndices();
                     if (indices.size() == 1) {
@@ -476,10 +560,13 @@ class IndicesAndAliasesResolver {
         return resolvedAliasOrIndex;
     }
 
-    private static List<String> loadAuthorizedAliases(Supplier<Set<String>> authorizedIndices, ProjectMetadata projectMetadata) {
+    private static List<String> loadAuthorizedAliases(
+        AuthorizationEngine.AuthorizedIndices authorizedIndices,
+        ProjectMetadata projectMetadata
+    ) {
         List<String> authorizedAliases = new ArrayList<>();
         SortedMap<String, IndexAbstraction> existingAliases = projectMetadata.getIndicesLookup();
-        for (String authorizedIndex : authorizedIndices.get()) {
+        for (String authorizedIndex : authorizedIndices.all(IndexComponentSelector.DATA)) {
             IndexAbstraction indexAbstraction = existingAliases.get(authorizedIndex);
             if (indexAbstraction != null && indexAbstraction.getType() == IndexAbstraction.Type.ALIAS) {
                 authorizedAliases.add(authorizedIndex);
@@ -498,6 +585,7 @@ class IndicesAndAliasesResolver {
         }
 
         for (String aliasExpression : aliases) {
+            IndexNameExpressionResolver.assertExpressionHasNullOrDataSelector(aliasExpression);
             boolean include = true;
             if (aliasExpression.charAt(0) == '-') {
                 include = false;
@@ -533,18 +621,20 @@ class IndicesAndAliasesResolver {
 
         private final CopyOnWriteArraySet<String> clusters;
 
-        private RemoteClusterResolver(Settings settings, ClusterSettings clusterSettings) {
+        private RemoteClusterResolver(Settings settings, LinkedProjectConfigService linkedProjectConfigService) {
             super(settings);
-            clusters = new CopyOnWriteArraySet<>(getEnabledRemoteClusters(settings));
-            listenForUpdates(clusterSettings);
+            clusters = new CopyOnWriteArraySet<>(
+                linkedProjectConfigService.getInitialLinkedProjectConfigs().stream().map(LinkedProjectConfig::linkedProjectAlias).toList()
+            );
+            linkedProjectConfigService.register(this);
         }
 
         @Override
-        protected void updateRemoteCluster(String clusterAlias, Settings settings) {
-            if (RemoteConnectionStrategy.isConnectionEnabled(clusterAlias, settings)) {
-                clusters.add(clusterAlias);
+        public void updateLinkedProject(LinkedProjectConfig config) {
+            if (config.isConnectionEnabled()) {
+                clusters.add(config.linkedProjectAlias());
             } else {
-                clusters.remove(clusterAlias);
+                clusters.remove(config.linkedProjectAlias());
             }
         }
 

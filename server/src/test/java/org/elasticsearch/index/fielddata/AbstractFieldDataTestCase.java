@@ -92,11 +92,9 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
             if (docValues) {
                 fieldType = new KeywordFieldMapper.Builder(fieldName, IndexVersion.current()).build(context).fieldType();
             } else {
-                fieldType = new TextFieldMapper.Builder(
-                    fieldName,
-                    createDefaultIndexAnalyzers(),
-                    SourceFieldMapper.isSynthetic(indexService.getIndexSettings())
-                ).fielddata(true).build(context).fieldType();
+                fieldType = new TextFieldMapper.Builder(fieldName, createDefaultIndexAnalyzers()).fielddata(true)
+                    .build(context)
+                    .fieldType();
             }
         } else if (type.equals("float")) {
             fieldType = new NumberFieldMapper.Builder(
@@ -106,6 +104,18 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
+                null
+            ).docValues(docValues).build(context).fieldType();
+        } else if (type.equals("half_float")) {
+            fieldType = new NumberFieldMapper.Builder(
+                fieldName,
+                NumberFieldMapper.NumberType.HALF_FLOAT,
+                ScriptCompiler.NONE,
+                false,
+                true,
+                IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("double")) {
@@ -116,6 +126,7 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("long")) {
@@ -126,6 +137,7 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("int")) {
@@ -136,6 +148,7 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("short")) {
@@ -146,6 +159,7 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("byte")) {
@@ -156,6 +170,7 @@ public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
                 false,
                 true,
                 IndexVersion.current(),
+                null,
                 null
             ).docValues(docValues).build(context).fieldType();
         } else if (type.equals("geo_point")) {

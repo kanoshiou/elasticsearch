@@ -23,7 +23,6 @@ import org.elasticsearch.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.util.Objects;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -32,17 +31,14 @@ import java.util.function.Supplier;
 public class ExchangeSinkOperator extends SinkOperator {
 
     private final ExchangeSink sink;
-    private final Function<Page, Page> transformer;
     private int pagesReceived;
     private long rowsReceived;
 
-    public record ExchangeSinkOperatorFactory(Supplier<ExchangeSink> exchangeSinks, Function<Page, Page> transformer)
-        implements
-            SinkOperatorFactory {
+    public record ExchangeSinkOperatorFactory(Supplier<ExchangeSink> exchangeSinks) implements SinkOperatorFactory {
 
         @Override
         public SinkOperator get(DriverContext driverContext) {
-            return new ExchangeSinkOperator(exchangeSinks.get(), transformer);
+            return new ExchangeSinkOperator(exchangeSinks.get());
         }
 
         @Override
@@ -51,9 +47,8 @@ public class ExchangeSinkOperator extends SinkOperator {
         }
     }
 
-    public ExchangeSinkOperator(ExchangeSink sink, Function<Page, Page> transformer) {
+    public ExchangeSinkOperator(ExchangeSink sink) {
         this.sink = sink;
-        this.transformer = transformer;
     }
 
     @Override
@@ -84,7 +79,7 @@ public class ExchangeSinkOperator extends SinkOperator {
     protected void doAddInput(Page page) {
         pagesReceived++;
         rowsReceived += page.getPositionCount();
-        sink.addPage(transformer.apply(page));
+        sink.addPage(page);
     }
 
     @Override
@@ -119,21 +114,13 @@ public class ExchangeSinkOperator extends SinkOperator {
 
         Status(StreamInput in) throws IOException {
             pagesReceived = in.readVInt();
-
-            if (in.getTransportVersion().onOrAfter(TransportVersions.ESQL_PROFILE_ROWS_PROCESSED)) {
-                rowsReceived = in.readVLong();
-            } else {
-                rowsReceived = 0;
-            }
+            rowsReceived = in.readVLong();
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             out.writeVInt(pagesReceived);
-
-            if (out.getTransportVersion().onOrAfter(TransportVersions.ESQL_PROFILE_ROWS_PROCESSED)) {
-                out.writeVLong(rowsReceived);
-            }
+            out.writeVLong(rowsReceived);
         }
 
         @Override

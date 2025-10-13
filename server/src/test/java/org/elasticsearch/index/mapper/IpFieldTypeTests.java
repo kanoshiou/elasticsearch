@@ -99,12 +99,12 @@ public class IpFieldTypeTests extends FieldTypeTestCase {
 
         MappedFieldType unsearchable = new IpFieldMapper.IpFieldType(
             "field",
-            false,
-            false,
+            IndexType.NONE,
             false,
             null,
             null,
             Collections.emptyMap(),
+            false,
             false
         );
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> unsearchable.termQuery("::1", MOCK_CONTEXT));
@@ -333,12 +333,12 @@ public class IpFieldTypeTests extends FieldTypeTestCase {
 
         MappedFieldType unsearchable = new IpFieldMapper.IpFieldType(
             "field",
-            false,
-            false,
+            IndexType.NONE,
             false,
             null,
             null,
             Collections.emptyMap(),
+            false,
             false
         );
         IllegalArgumentException e = expectThrows(

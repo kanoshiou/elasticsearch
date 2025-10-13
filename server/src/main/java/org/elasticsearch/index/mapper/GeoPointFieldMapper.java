@@ -54,9 +54,11 @@ import org.elasticsearch.search.lookup.SearchLookup;
 import org.elasticsearch.search.runtime.GeoPointScriptFieldDistanceFeatureQuery;
 import org.elasticsearch.xcontent.CopyingXContentParser;
 import org.elasticsearch.xcontent.FilterXContentParserWrapper;
+import org.elasticsearch.xcontent.Text;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentString;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -66,6 +68,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+
+import static org.elasticsearch.index.mapper.MappedFieldType.FieldExtractPreference.DOC_VALUES;
 
 /**
  * Field Mapper for geo_point types.
@@ -214,17 +218,20 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
                 metric.get() != TimeSeriesParams.MetricType.POSITION,
                 context.isSourceSynthetic() && ignoreMalformedEnabled
             );
+            IndexType indexType = indexCreatedVersion.isLegacyIndexVersion()
+                ? IndexType.archivedPoints()
+                : IndexType.points(indexed.get(), hasDocValues.get());
             GeoPointFieldType ft = new GeoPointFieldType(
                 context.buildFullName(leafName()),
-                indexed.get() && indexCreatedVersion.isLegacyIndexVersion() == false,
+                indexType,
                 stored.get(),
-                hasDocValues.get(),
                 geoParser,
                 nullValue.get(),
                 scriptValues(),
                 meta.get(),
                 metric.get(),
-                indexMode
+                indexMode,
+                context.isSourceSynthetic()
             );
             hasScript = script.get() != null;
             onScriptError = onScriptErrorParam.get();
@@ -287,7 +294,7 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
 
     @Override
     protected void index(DocumentParserContext context, GeoPoint geometry) throws IOException {
-        final boolean indexed = fieldType().isIndexed();
+        final boolean indexed = fieldType().indexType.hasPoints();
         final boolean hasDocValues = fieldType().hasDocValues();
         final boolean store = fieldType().isStored();
         if (indexed && hasDocValues) {
@@ -313,7 +320,7 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
 
     /**
      * Parser that pretends to be the main document parser, but exposes the provided geohash regardless of how the geopoint was provided
-     * in the incoming document. We rely on the fact that consumers are only ever call {@link XContentParser#textOrNull()} and never
+     * in the incoming document. We rely on the fact that consumers only ever read text from the parser and never
      * advance tokens, which is explicitly disallowed by this parser.
      */
     static class GeoHashMultiFieldParser extends FilterXContentParserWrapper {
@@ -325,7 +332,17 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
         }
 
         @Override
+        public XContentString optimizedTextOrNull() throws IOException {
+            return new Text(value);
+        }
+
+        @Override
         public String textOrNull() throws IOException {
+            return value;
+        }
+
+        @Override
+        public String text() throws IOException {
             return value;
         }
 
@@ -370,28 +387,30 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
 
         private final FieldValues<GeoPoint> scriptValues;
         private final IndexMode indexMode;
+        private final boolean isSyntheticSource;
 
         private GeoPointFieldType(
             String name,
-            boolean indexed,
+            IndexType indexType,
             boolean stored,
-            boolean hasDocValues,
             Parser<GeoPoint> parser,
             GeoPoint nullValue,
             FieldValues<GeoPoint> scriptValues,
             Map<String, String> meta,
             TimeSeriesParams.MetricType metricType,
-            IndexMode indexMode
+            IndexMode indexMode,
+            boolean isSyntheticSource
         ) {
-            super(name, indexed, stored, hasDocValues, parser, nullValue, meta);
+            super(name, indexType, stored, parser, nullValue, meta);
             this.scriptValues = scriptValues;
             this.metricType = metricType;
             this.indexMode = indexMode;
+            this.isSyntheticSource = isSyntheticSource;
         }
 
         // only used in test
         public GeoPointFieldType(String name, TimeSeriesParams.MetricType metricType, IndexMode indexMode) {
-            this(name, true, false, true, null, null, null, Collections.emptyMap(), metricType, indexMode);
+            this(name, IndexType.points(true, true), false, null, null, null, Collections.emptyMap(), metricType, indexMode, false);
         }
 
         // only used in test
@@ -406,7 +425,7 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
 
         @Override
         public boolean isSearchable() {
-            return isIndexed() || hasDocValues();
+            return indexType.hasPoints() || hasDocValues();
         }
 
         @Override
@@ -436,7 +455,7 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
                 luceneRelation = relation.getLuceneRelation();
             }
             Query query;
-            if (isIndexed()) {
+            if (indexType.hasPoints()) {
                 query = LatLonPoint.newGeometryQuery(fieldName, luceneRelation, geometries);
                 if (hasDocValues()) {
                     Query dvQuery = LatLonDocValuesField.newSlowGeometryQuery(fieldName, luceneRelation, geometries);
@@ -501,7 +520,7 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
                 );
             }
             double pivotDouble = DistanceUnit.DEFAULT.parse(pivot, DistanceUnit.DEFAULT);
-            if (isIndexed()) {
+            if (indexType.hasPoints()) {
                 // As we already apply boost in AbstractQueryBuilder::toQuery, we always passing a boost of 1.0 to distanceFeatureQuery
                 return LatLonPoint.newDistanceFeatureQuery(name(), 1.0f, originGeoPoint.lat(), originGeoPoint.lon(), pivotDouble);
             } else {
@@ -523,6 +542,29 @@ public class GeoPointFieldMapper extends AbstractPointGeometryFieldMapper<GeoPoi
         @Override
         public TimeSeriesParams.MetricType getMetricType() {
             return metricType;
+        }
+
+        @Override
+        public BlockLoader blockLoader(BlockLoaderContext blContext) {
+            if (blContext.fieldExtractPreference() == DOC_VALUES && hasDocValues()) {
+                return new BlockDocValuesReader.LongsBlockLoader(name());
+            }
+
+            // There are two scenarios possible once we arrive here:
+            //
+            // * Stored source - we'll just use blockLoaderFromSource
+            // * Synthetic source. However, because of the fieldExtractPreference() check above it is still possible that doc_values are
+            // present here.
+            // So we have two subcases:
+            // - doc_values are enabled - _ignored_source field does not exist since we have doc_values. We will use
+            // blockLoaderFromSource which reads "native" synthetic source.
+            // - doc_values are disabled - we know that _ignored_source field is present and use a special block loader unless it's a multi
+            // field.
+            if (isSyntheticSource && hasDocValues() == false && blContext.parentField(name()) == null) {
+                return blockLoaderFromFallbackSyntheticSource(blContext);
+            }
+
+            return blockLoaderFromSource(blContext);
         }
     }
 

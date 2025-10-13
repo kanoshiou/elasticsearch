@@ -25,10 +25,13 @@ import org.elasticsearch.common.time.DateUtils;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.FeatureFlag;
+import org.elasticsearch.core.Booleans;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.mapper.IgnoredSourceFieldMapper;
 import org.elasticsearch.index.mapper.Mapper;
+import org.elasticsearch.index.mapper.SeqNoFieldMapper;
 import org.elasticsearch.index.mapper.SourceFieldMapper;
+import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
 import org.elasticsearch.index.translog.Translog;
 import org.elasticsearch.indices.recovery.RecoverySettings;
 import org.elasticsearch.ingest.IngestService;
@@ -49,6 +52,7 @@ import static org.elasticsearch.cluster.routing.allocation.ExistingShardsAllocat
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_DEPTH_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_DIMENSION_FIELDS_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_FIELD_NAME_LENGTH_LIMIT_SETTING;
+import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_FIELD_NAME_LENGTH_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_NESTED_DOCS_LIMIT_SETTING;
 import static org.elasticsearch.index.mapper.MapperService.INDEX_MAPPING_NESTED_FIELDS_LIMIT_SETTING;
@@ -303,7 +307,7 @@ public final class IndexSettings {
     static class RefreshIntervalValidator implements Setting.Validator<TimeValue> {
 
         static final String STATELESS_ALLOW_INDEX_REFRESH_INTERVAL_OVERRIDE = "es.stateless.allow.index.refresh_interval.override";
-        private static final boolean IS_OVERRIDE_ALLOWED = Boolean.parseBoolean(
+        private static final boolean IS_OVERRIDE_ALLOWED = Booleans.parseBoolean(
             System.getProperty(STATELESS_ALLOW_INDEX_REFRESH_INTERVAL_OVERRIDE, "false")
         );
 
@@ -539,17 +543,6 @@ public final class IndexSettings {
     );
 
     /**
-     * Marks an index to be searched throttled. This means that never more than one shard of such an index will be searched concurrently
-     */
-    public static final Setting<Boolean> INDEX_SEARCH_THROTTLED = Setting.boolSetting(
-        "index.search.throttled",
-        false,
-        Property.IndexScope,
-        Property.PrivateIndex,
-        Property.Dynamic
-    );
-
-    /**
      * Determines a balance between file-based and operations-based peer recoveries. The number of operations that will be used in an
      * operations-based peer recovery is limited to this proportion of the total number of documents in the shard (including deleted
      * documents) on the grounds that a file-based peer recovery may copy all of the documents in the shard over to the new peer, but is
@@ -625,21 +618,11 @@ public final class IndexSettings {
                 if (startTime.toEpochMilli() > value.toEpochMilli()) {
                     throw new IllegalArgumentException("index.time_series.end_time must be larger than index.time_series.start_time");
                 }
-
-                // The index.time_series.end_time setting can only be specified if the index.mode setting has been set to time_series
-                // This check here is specifically needed because in case of updating index settings the validation the gets executed
-                // in IndexSettings constructor when reading the index.mode setting doesn't get executed.
-                IndexMode indexMode = (IndexMode) settings.get(MODE);
-                if (indexMode != IndexMode.TIME_SERIES) {
-                    throw new IllegalArgumentException(
-                        "[" + TIME_SERIES_END_TIME.getKey() + "] requires [index.mode=" + IndexMode.TIME_SERIES + "]"
-                    );
-                }
             }
 
             @Override
             public Iterator<Setting<?>> settings() {
-                List<Setting<?>> settings = List.of(TIME_SERIES_START_TIME, MODE);
+                List<Setting<?>> settings = List.of(TIME_SERIES_START_TIME);
                 return settings.iterator();
             }
         },
@@ -685,10 +668,10 @@ public final class IndexSettings {
         Property.Final
     );
 
-    public static final FeatureFlag DOC_VALUES_SKIPPER = new FeatureFlag("doc_values_skipper");
+    public static final boolean DOC_VALUES_SKIPPER = new FeatureFlag("doc_values_skipper").isEnabled();
     public static final Setting<Boolean> USE_DOC_VALUES_SKIPPER = Setting.boolSetting(
         "index.mapping.use_doc_values_skipper",
-        IndexSettings.DOC_VALUES_SKIPPER.isEnabled(),
+        false,
         Property.IndexScope,
         Property.Final
     );
@@ -823,21 +806,47 @@ public final class IndexSettings {
 
     public static final Setting<Integer> IGNORE_ABOVE_SETTING = Setting.intSetting(
         "index.mapping.ignore_above",
-        IndexSettings::getIgnoreAboveDefaultValue,
+        settings -> String.valueOf(getIgnoreAboveDefaultValue(settings)),
         0,
         Integer.MAX_VALUE,
         Property.IndexScope,
         Property.ServerlessPublic
     );
 
-    private static String getIgnoreAboveDefaultValue(final Settings settings) {
-        if (IndexSettings.MODE.get(settings) == IndexMode.LOGSDB
-            && IndexMetadata.SETTING_INDEX_VERSION_CREATED.get(settings).onOrAfter(IndexVersions.ENABLE_IGNORE_ABOVE_LOGSDB)) {
-            return "8191";
-        } else {
-            return String.valueOf(Integer.MAX_VALUE);
+    private static int getIgnoreAboveDefaultValue(final Settings settings) {
+        if (settings == null) {
+            return Mapper.IgnoreAbove.IGNORE_ABOVE_DEFAULT_VALUE;
         }
+        return Mapper.IgnoreAbove.getIgnoreAboveDefaultValue(
+            IndexSettings.MODE.get(settings),
+            IndexMetadata.SETTING_INDEX_VERSION_CREATED.get(settings)
+        );
     }
+
+    public static final Setting<SeqNoFieldMapper.SeqNoIndexOptions> SEQ_NO_INDEX_OPTIONS_SETTING = Setting.enumSetting(
+        SeqNoFieldMapper.SeqNoIndexOptions.class,
+        settings -> {
+            final IndexMode indexMode = IndexSettings.MODE.get(settings);
+            if ((indexMode == IndexMode.LOGSDB || indexMode == IndexMode.TIME_SERIES)
+                && IndexMetadata.SETTING_INDEX_VERSION_CREATED.get(settings).onOrAfter(IndexVersions.SEQ_NO_WITHOUT_POINTS)) {
+                return SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY.toString();
+            } else {
+                return SeqNoFieldMapper.SeqNoIndexOptions.POINTS_AND_DOC_VALUES.toString();
+            }
+        },
+        "index.seq_no.index_options",
+        value -> {},
+        Property.IndexScope,
+        Property.Final
+    );
+
+    public static final Setting<Boolean> INDEX_MAPPING_EXCLUDE_SOURCE_VECTORS_SETTING = Setting.boolSetting(
+        "index.mapping.exclude_source_vectors",
+        settings -> String.valueOf(SETTING_INDEX_VERSION_CREATED.get(settings).onOrAfter(IndexVersions.EXCLUDE_SOURCE_VECTORS_DEFAULT)),
+        Property.IndexScope,
+        Property.Final,
+        Property.ServerlessPublic
+    );
 
     private final Index index;
     private final IndexVersion version;
@@ -882,7 +891,6 @@ public final class IndexSettings {
     private final boolean logsdbRouteOnSortFields;
     private final boolean logsdbSortOnHostName;
     private final boolean logsdbAddHostNameField;
-
     private volatile long retentionLeaseMillis;
 
     /**
@@ -907,17 +915,19 @@ public final class IndexSettings {
     private volatile int maxTokenCount;
     private volatile int maxNgramDiff;
     private volatile int maxShingleDiff;
+    private volatile DenseVectorFieldMapper.FilterHeuristic hnswFilterHeuristic;
+    private volatile boolean earlyTermination;
     private volatile TimeValue searchIdleAfter;
     private volatile int maxAnalyzedOffset;
     private volatile boolean weightMatchesEnabled;
     private volatile int maxTermsCount;
     private volatile String defaultPipeline;
     private volatile String requiredPipeline;
-    private volatile boolean searchThrottled;
     private volatile long mappingNestedFieldsLimit;
     private volatile long mappingNestedDocsLimit;
     private volatile long mappingTotalFieldsLimit;
     private volatile boolean ignoreDynamicFieldsBeyondLimit;
+    private volatile boolean ignoreDynamicFieldNamesBeyondLimit;
     private volatile long mappingDepthLimit;
     private volatile long mappingFieldNameLengthLimit;
     private volatile long mappingDimensionFieldsLimit;
@@ -943,6 +953,7 @@ public final class IndexSettings {
     private volatile int maxRegexLength;
 
     private final IndexRouting indexRouting;
+    private final SeqNoFieldMapper.SeqNoIndexOptions seqNoIndexOptions;
 
     /**
      * The default mode for storing source, for all mappers not overriding this setting.
@@ -1042,7 +1053,6 @@ public final class IndexSettings {
                 this.timestampBounds = TimestampBounds.updateEndTime(this.timestampBounds, endTime);
             });
         }
-        this.searchThrottled = INDEX_SEARCH_THROTTLED.get(settings);
         this.queryStringLenient = QUERY_STRING_LENIENT_SETTING.get(settings);
         this.queryStringAnalyzeWildcard = QUERY_STRING_ANALYZE_WILDCARD.get(nodeSettings);
         this.queryStringAllowLeadingWildcard = QUERY_STRING_ALLOW_LEADING_WILDCARD.get(nodeSettings);
@@ -1093,6 +1103,7 @@ public final class IndexSettings {
         mappingNestedDocsLimit = scopedSettings.get(INDEX_MAPPING_NESTED_DOCS_LIMIT_SETTING);
         mappingTotalFieldsLimit = scopedSettings.get(INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING);
         ignoreDynamicFieldsBeyondLimit = scopedSettings.get(INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_LIMIT_SETTING);
+        ignoreDynamicFieldNamesBeyondLimit = scopedSettings.get(INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_FIELD_NAME_LENGTH_SETTING);
         mappingDepthLimit = scopedSettings.get(INDEX_MAPPING_DEPTH_LIMIT_SETTING);
         mappingFieldNameLengthLimit = scopedSettings.get(INDEX_MAPPING_FIELD_NAME_LENGTH_LIMIT_SETTING);
         mappingDimensionFieldsLimit = scopedSettings.get(INDEX_MAPPING_DIMENSION_FIELDS_LIMIT_SETTING);
@@ -1104,11 +1115,14 @@ public final class IndexSettings {
         logsdbAddHostNameField = scopedSettings.get(LOGSDB_ADD_HOST_NAME_FIELD);
         skipIgnoredSourceWrite = scopedSettings.get(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_WRITE_SETTING);
         skipIgnoredSourceRead = scopedSettings.get(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_READ_SETTING);
+        hnswFilterHeuristic = scopedSettings.get(DenseVectorFieldMapper.HNSW_FILTER_HEURISTIC);
+        earlyTermination = scopedSettings.get(DenseVectorFieldMapper.HNSW_EARLY_TERMINATION);
         indexMappingSourceMode = scopedSettings.get(INDEX_MAPPER_SOURCE_MODE_SETTING);
         recoverySourceEnabled = RecoverySettings.INDICES_RECOVERY_SOURCE_ENABLED_SETTING.get(nodeSettings);
         recoverySourceSyntheticEnabled = DiscoveryNode.isStateless(nodeSettings) == false
             && scopedSettings.get(RECOVERY_USE_SYNTHETIC_SOURCE_SETTING);
-        useDocValuesSkipper = DOC_VALUES_SKIPPER.isEnabled() && scopedSettings.get(USE_DOC_VALUES_SKIPPER);
+        useDocValuesSkipper = DOC_VALUES_SKIPPER && scopedSettings.get(USE_DOC_VALUES_SKIPPER);
+        seqNoIndexOptions = scopedSettings.get(SEQ_NO_INDEX_OPTIONS_SETTING);
         if (recoverySourceSyntheticEnabled) {
             if (DiscoveryNode.isStateless(settings)) {
                 throw new IllegalArgumentException("synthetic recovery source is only allowed in stateful");
@@ -1200,13 +1214,16 @@ public final class IndexSettings {
         scopedSettings.addSettingsUpdateConsumer(DEFAULT_PIPELINE, this::setDefaultPipeline);
         scopedSettings.addSettingsUpdateConsumer(FINAL_PIPELINE, this::setRequiredPipeline);
         scopedSettings.addSettingsUpdateConsumer(INDEX_SOFT_DELETES_RETENTION_OPERATIONS_SETTING, this::setSoftDeleteRetentionOperations);
-        scopedSettings.addSettingsUpdateConsumer(INDEX_SEARCH_THROTTLED, this::setSearchThrottled);
         scopedSettings.addSettingsUpdateConsumer(INDEX_SOFT_DELETES_RETENTION_LEASE_PERIOD_SETTING, this::setRetentionLeaseMillis);
         scopedSettings.addSettingsUpdateConsumer(INDEX_MAPPING_NESTED_FIELDS_LIMIT_SETTING, this::setMappingNestedFieldsLimit);
         scopedSettings.addSettingsUpdateConsumer(INDEX_MAPPING_NESTED_DOCS_LIMIT_SETTING, this::setMappingNestedDocsLimit);
         scopedSettings.addSettingsUpdateConsumer(
             INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_LIMIT_SETTING,
             this::setIgnoreDynamicFieldsBeyondLimit
+        );
+        scopedSettings.addSettingsUpdateConsumer(
+            INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_FIELD_NAME_LENGTH_SETTING,
+            this::setIgnoreDynamicFieldNamesBeyondLimit
         );
         scopedSettings.addSettingsUpdateConsumer(INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING, this::setMappingTotalFieldsLimit);
         scopedSettings.addSettingsUpdateConsumer(INDEX_MAPPING_DEPTH_LIMIT_SETTING, this::setMappingDepthLimit);
@@ -1217,6 +1234,8 @@ public final class IndexSettings {
             this::setSkipIgnoredSourceWrite
         );
         scopedSettings.addSettingsUpdateConsumer(IgnoredSourceFieldMapper.SKIP_IGNORED_SOURCE_READ_SETTING, this::setSkipIgnoredSourceRead);
+        scopedSettings.addSettingsUpdateConsumer(DenseVectorFieldMapper.HNSW_FILTER_HEURISTIC, this::setHnswFilterHeuristic);
+        scopedSettings.addSettingsUpdateConsumer(DenseVectorFieldMapper.HNSW_EARLY_TERMINATION, this::setHnswEarlyTermination);
     }
 
     private void setSearchIdleAfter(TimeValue searchIdleAfter) {
@@ -1725,18 +1744,6 @@ public final class IndexSettings {
         return this.softDeleteRetentionOperations;
     }
 
-    /**
-     * Returns true if the this index should be searched throttled ie. using the
-     * {@link org.elasticsearch.threadpool.ThreadPool.Names#SEARCH_THROTTLED} thread-pool
-     */
-    public boolean isSearchThrottled() {
-        return searchThrottled;
-    }
-
-    private void setSearchThrottled(boolean searchThrottled) {
-        this.searchThrottled = searchThrottled;
-    }
-
     public long getMappingNestedFieldsLimit() {
         return mappingNestedFieldsLimit;
     }
@@ -1765,8 +1772,16 @@ public final class IndexSettings {
         this.ignoreDynamicFieldsBeyondLimit = ignoreDynamicFieldsBeyondLimit;
     }
 
+    private void setIgnoreDynamicFieldNamesBeyondLimit(boolean ignoreDynamicFieldNamesBeyondLimit) {
+        this.ignoreDynamicFieldNamesBeyondLimit = ignoreDynamicFieldNamesBeyondLimit;
+    }
+
     public boolean isIgnoreDynamicFieldsBeyondLimit() {
         return ignoreDynamicFieldsBeyondLimit;
+    }
+
+    public boolean isIgnoreDynamicFieldNamesBeyondLimit() {
+        return ignoreDynamicFieldNamesBeyondLimit;
     }
 
     public long getMappingDepthLimit() {
@@ -1846,5 +1861,29 @@ public final class IndexSettings {
      */
     public IndexRouting getIndexRouting() {
         return indexRouting;
+    }
+
+    /**
+     * The heuristic to utilize when executing filtered search on vectors indexed
+     * in HNSW format.
+     */
+    public DenseVectorFieldMapper.FilterHeuristic getHnswFilterHeuristic() {
+        return this.hnswFilterHeuristic;
+    }
+
+    private void setHnswFilterHeuristic(DenseVectorFieldMapper.FilterHeuristic heuristic) {
+        this.hnswFilterHeuristic = heuristic;
+    }
+
+    public boolean getHnswEarlyTermination() {
+        return this.earlyTermination;
+    }
+
+    private void setHnswEarlyTermination(boolean earlyTermination) {
+        this.earlyTermination = earlyTermination;
+    }
+
+    public SeqNoFieldMapper.SeqNoIndexOptions seqNoIndexOptions() {
+        return seqNoIndexOptions;
     }
 }

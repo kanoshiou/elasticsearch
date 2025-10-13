@@ -33,7 +33,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.stream.Collectors;
 
 /**
  * Writes a text embedding result in the follow json format
@@ -58,16 +57,6 @@ public record TextEmbeddingFloatResults(List<Embedding> embeddings) implements T
 
     public TextEmbeddingFloatResults(StreamInput in) throws IOException {
         this(in.readCollectionAsList(TextEmbeddingFloatResults.Embedding::new));
-    }
-
-    @SuppressWarnings("deprecation")
-    TextEmbeddingFloatResults(LegacyTextEmbeddingResults legacyTextEmbeddingResults) {
-        this(
-            legacyTextEmbeddingResults.embeddings()
-                .stream()
-                .map(embedding -> new Embedding(embedding.values()))
-                .collect(Collectors.toList())
-        );
     }
 
     public static TextEmbeddingFloatResults of(List<? extends InferenceResults> results) {
@@ -120,16 +109,6 @@ public record TextEmbeddingFloatResults(List<Embedding> embeddings) implements T
     @Override
     public List<? extends InferenceResults> transformToCoordinationFormat() {
         return embeddings.stream().map(embedding -> new MlTextEmbeddingResults(TEXT_EMBEDDING, embedding.asDoubleArray(), false)).toList();
-    }
-
-    @Override
-    @SuppressWarnings("deprecation")
-    public List<? extends InferenceResults> transformToLegacyFormat() {
-        var legacyEmbedding = new LegacyTextEmbeddingResults(
-            embeddings.stream().map(embedding -> new LegacyTextEmbeddingResults.Embedding(embedding.values)).toList()
-        );
-
-        return List.of(legacyEmbedding);
     }
 
     public Map<String, Object> asMap() {

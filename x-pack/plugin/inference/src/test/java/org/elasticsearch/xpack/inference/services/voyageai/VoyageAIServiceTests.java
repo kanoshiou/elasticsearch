@@ -12,21 +12,24 @@ import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ElasticsearchStatusException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
+import org.elasticsearch.common.ValidationException;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.inference.ChunkInferenceInput;
 import org.elasticsearch.inference.ChunkedInference;
 import org.elasticsearch.inference.ChunkingSettings;
+import org.elasticsearch.inference.InferenceService;
 import org.elasticsearch.inference.InferenceServiceConfiguration;
 import org.elasticsearch.inference.InferenceServiceResults;
 import org.elasticsearch.inference.InputType;
 import org.elasticsearch.inference.Model;
 import org.elasticsearch.inference.ModelConfigurations;
+import org.elasticsearch.inference.RerankingInferenceService;
 import org.elasticsearch.inference.SimilarityMeasure;
 import org.elasticsearch.inference.TaskType;
-import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.http.MockResponse;
 import org.elasticsearch.test.http.MockWebServer;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -38,8 +41,8 @@ import org.elasticsearch.xpack.core.inference.results.TextEmbeddingFloatResults;
 import org.elasticsearch.xpack.inference.external.http.HttpClientManager;
 import org.elasticsearch.xpack.inference.external.http.sender.HttpRequestSender;
 import org.elasticsearch.xpack.inference.external.http.sender.HttpRequestSenderTests;
-import org.elasticsearch.xpack.inference.external.http.sender.Sender;
 import org.elasticsearch.xpack.inference.logging.ThrottlerManager;
+import org.elasticsearch.xpack.inference.services.InferenceServiceTestCase;
 import org.elasticsearch.xpack.inference.services.voyageai.embeddings.VoyageAIEmbeddingsModel;
 import org.elasticsearch.xpack.inference.services.voyageai.embeddings.VoyageAIEmbeddingsModelTests;
 import org.elasticsearch.xpack.inference.services.voyageai.embeddings.VoyageAIEmbeddingsServiceSettingsTests;
@@ -53,7 +56,6 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
-import java.net.URISyntaxException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -64,12 +66,13 @@ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertToXC
 import static org.elasticsearch.xpack.core.inference.results.TextEmbeddingFloatResultsTests.buildExpectationFloat;
 import static org.elasticsearch.xpack.inference.Utils.getInvalidModel;
 import static org.elasticsearch.xpack.inference.Utils.getPersistedConfigMap;
-import static org.elasticsearch.xpack.inference.Utils.inferenceUtilityPool;
+import static org.elasticsearch.xpack.inference.Utils.inferenceUtilityExecutors;
 import static org.elasticsearch.xpack.inference.Utils.mockClusterServiceEmpty;
 import static org.elasticsearch.xpack.inference.chunking.ChunkingSettingsTests.createRandomChunkingSettings;
 import static org.elasticsearch.xpack.inference.chunking.ChunkingSettingsTests.createRandomChunkingSettingsMap;
 import static org.elasticsearch.xpack.inference.external.http.Utils.entityAsMap;
 import static org.elasticsearch.xpack.inference.external.http.Utils.getUrl;
+import static org.elasticsearch.xpack.inference.services.SenderServiceTests.createMockSender;
 import static org.elasticsearch.xpack.inference.services.ServiceComponentsTests.createWithEmptySettings;
 import static org.elasticsearch.xpack.inference.services.settings.DefaultSecretSettingsTests.getSecretSettingsMap;
 import static org.hamcrest.CoreMatchers.is;
@@ -77,13 +80,14 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
-public class VoyageAIServiceTests extends ESTestCase {
+public class VoyageAIServiceTests extends InferenceServiceTestCase {
     private static final TimeValue TIMEOUT = new TimeValue(30, TimeUnit.SECONDS);
     private final MockWebServer webServer = new MockWebServer();
     private ThreadPool threadPool;
@@ -92,7 +96,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     @Before
     public void init() throws Exception {
         webServer.start();
-        threadPool = createThreadPool(inferenceUtilityPool());
+        threadPool = createThreadPool(inferenceUtilityExecutors());
         clientManager = HttpClientManager.create(Settings.EMPTY, threadPool, mockClusterServiceEmpty(), mock(ThrottlerManager.class));
     }
 
@@ -109,8 +113,7 @@ public class VoyageAIServiceTests extends ESTestCase {
                 MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
                 var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-                assertNull(embeddingsModel.uri());
-                MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+                MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
                 MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
                 MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.INGEST, null)));
                 MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
@@ -126,7 +129,6 @@ public class VoyageAIServiceTests extends ESTestCase {
                 ),
                 modelListener
             );
-
         }
     }
 
@@ -136,8 +138,7 @@ public class VoyageAIServiceTests extends ESTestCase {
                 MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
                 var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-                assertNull(embeddingsModel.uri());
-                MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+                MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
                 MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
                 MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.INGEST, null)));
                 MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
@@ -166,8 +167,7 @@ public class VoyageAIServiceTests extends ESTestCase {
                 MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
                 var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-                assertNull(embeddingsModel.uri());
-                MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+                MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
                 MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
                 MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.INGEST, null)));
                 MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
@@ -196,8 +196,7 @@ public class VoyageAIServiceTests extends ESTestCase {
                 MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
                 var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-                assertNull(embeddingsModel.uri());
-                MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+                MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
                 MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
                 MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), equalTo(VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS));
                 MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
@@ -251,7 +250,7 @@ public class VoyageAIServiceTests extends ESTestCase {
 
             var failureListener = getModelListenerForException(
                 ElasticsearchStatusException.class,
-                "Model configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
+                "Configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
             );
             service.parseRequestConfig("id", TaskType.TEXT_EMBEDDING, config, failureListener);
         }
@@ -270,7 +269,7 @@ public class VoyageAIServiceTests extends ESTestCase {
 
             var failureListener = getModelListenerForException(
                 ElasticsearchStatusException.class,
-                "Model configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
+                "Configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
             );
             service.parseRequestConfig("id", TaskType.TEXT_EMBEDDING, config, failureListener);
         }
@@ -289,7 +288,7 @@ public class VoyageAIServiceTests extends ESTestCase {
 
             var failureListener = getModelListenerForException(
                 ElasticsearchStatusException.class,
-                "Model configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
+                "Configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
             );
             service.parseRequestConfig("id", TaskType.TEXT_EMBEDDING, config, failureListener);
 
@@ -309,7 +308,7 @@ public class VoyageAIServiceTests extends ESTestCase {
 
             var failureListener = getModelListenerForException(
                 ElasticsearchStatusException.class,
-                "Model configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
+                "Configuration contains settings [{extra_key=value}] unknown to the [voyageai] service"
             );
             service.parseRequestConfig("id", TaskType.TEXT_EMBEDDING, config, failureListener);
         }
@@ -333,13 +332,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -362,14 +358,11 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -391,14 +384,11 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -420,9 +410,10 @@ public class VoyageAIServiceTests extends ESTestCase {
                 )
             );
 
-            MatcherAssert.assertThat(
+            assertThat(thrownException.getMessage(), containsString("Failed to parse stored model [id] for [voyageai] service"));
+            assertThat(
                 thrownException.getMessage(),
-                is("Failed to parse stored model [id] for [voyageai] service, please delete and add the service again")
+                containsString("The [voyageai] service does not support task type [sparse_embedding]")
             );
         }
     }
@@ -446,13 +437,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.SEARCH, null)));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -477,13 +465,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -506,13 +491,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -537,13 +519,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -568,13 +547,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.SEARCH, null)));
             MatcherAssert.assertThat(embeddingsModel.getSecretSettings().apiKey().toString(), is("secret"));
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -590,13 +566,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -613,14 +586,11 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -636,14 +606,11 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             MatcherAssert.assertThat(embeddingsModel.getConfigurations().getChunkingSettings(), instanceOf(ChunkingSettings.class));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -659,9 +626,10 @@ public class VoyageAIServiceTests extends ESTestCase {
                 () -> service.parsePersistedConfig("id", TaskType.SPARSE_EMBEDDING, persistedConfig.config())
             );
 
-            MatcherAssert.assertThat(
+            assertThat(thrownException.getMessage(), containsString("Failed to parse stored model [id] for [voyageai] service"));
+            assertThat(
                 thrownException.getMessage(),
-                is("Failed to parse stored model [id] for [voyageai] service, please delete and add the service again")
+                containsString("The [voyageai] service does not support task type [sparse_embedding]")
             );
         }
     }
@@ -678,7 +646,6 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings((InputType) null, null)));
             assertNull(embeddingsModel.getSecretSettings());
@@ -698,13 +665,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -723,13 +687,10 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.SEARCH, null)));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -747,28 +708,27 @@ public class VoyageAIServiceTests extends ESTestCase {
             MatcherAssert.assertThat(model, instanceOf(VoyageAIEmbeddingsModel.class));
 
             var embeddingsModel = (VoyageAIEmbeddingsModel) model;
-            assertNull(embeddingsModel.uri());
-            MatcherAssert.assertThat(embeddingsModel.buildUri().toString(), is("https://api.voyageai.com/v1/embeddings"));
+            MatcherAssert.assertThat(embeddingsModel.uri().toString(), is("https://api.voyageai.com/v1/embeddings"));
             MatcherAssert.assertThat(embeddingsModel.getServiceSettings().getCommonSettings().modelId(), is("model"));
             MatcherAssert.assertThat(embeddingsModel.getTaskSettings(), is(new VoyageAIEmbeddingsTaskSettings(InputType.INGEST, null)));
             assertNull(embeddingsModel.getSecretSettings());
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
         }
     }
 
     public void testInfer_ThrowsErrorWhenModelIsNotVoyageAIModel() throws IOException {
-        var sender = mock(Sender.class);
+        var sender = createMockSender();
 
         var factory = mock(HttpRequestSender.Factory.class);
         when(factory.createSender()).thenReturn(sender);
 
         var mockModel = getInvalidModel("model_id", "service_name");
 
-        try (var service = new VoyageAIService(factory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(factory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 mockModel,
+                null,
+                null,
                 null,
                 List.of(""),
                 false,
@@ -785,7 +745,7 @@ public class VoyageAIServiceTests extends ESTestCase {
             );
 
             verify(factory, times(1)).createSender();
-            verify(sender, times(1)).start();
+            verify(sender, times(1)).startAsynchronously(any());
         }
 
         verify(sender, times(1)).close();
@@ -793,173 +753,50 @@ public class VoyageAIServiceTests extends ESTestCase {
         verifyNoMoreInteractions(sender);
     }
 
-    public void testCheckModelConfig_UpdatesDimensions() throws IOException {
-        var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
+    public void testInfer_ThrowsValidationErrorForInvalidInputType() throws IOException {
+        var sender = createMockSender();
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        var factory = mock(HttpRequestSender.Factory.class);
+        when(factory.createSender()).thenReturn(sender);
 
-            String responseJson = """
-                {
-                    "model": "voyage-3-large",
-                    "object": "list",
-                    "usage": {
-                        "total_tokens": 5
-                    },
-                    "data": [
-                        {
-                            "object": "embedding",
-                            "index": 0,
-                            "embedding": [
-                                0.123,
-                                -0.123
-                            ]
-                        }
-                    ]
-                }
-                """;
-            webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
+        var model = VoyageAIEmbeddingsModelTests.createModel(
+            getUrl(webServer),
+            "secret",
+            VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
+            10,
+            1,
+            "voyage-3-large"
+        );
 
-            var model = VoyageAIEmbeddingsModelTests.createModel(
-                getUrl(webServer),
-                "secret",
-                VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                10,
-                1,
-                "voyage-3-large"
+        try (var service = new VoyageAIService(factory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
+            PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
+
+            service.infer(
+                model,
+                null,
+                null,
+                null,
+                List.of(""),
+                false,
+                new HashMap<>(),
+                InputType.CLUSTERING,
+                InferenceAction.Request.DEFAULT_TIMEOUT,
+                listener
             );
-            PlainActionFuture<Model> listener = new PlainActionFuture<>();
-            service.checkModelConfig(model, listener);
-            var result = listener.actionGet(TIMEOUT);
 
+            var thrownException = expectThrows(ValidationException.class, () -> listener.actionGet(TIMEOUT));
             MatcherAssert.assertThat(
-                result,
-                // the dimension is set to 2 because there are 2 embeddings returned from the mock server
-                is(
-                    VoyageAIEmbeddingsModelTests.createModel(
-                        getUrl(webServer),
-                        "secret",
-                        VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                        10,
-                        2,
-                        "voyage-3-large"
-                    )
-                )
+                thrownException.getMessage(),
+                is("Validation Failed: 1: Input type [clustering] is not supported for [Voyage AI];")
             );
+
+            verify(factory, times(1)).createSender();
+            verify(sender, times(1)).startAsynchronously(any());
         }
-    }
 
-    public void testCheckModelConfig_UpdatesSimilarityToDotProduct_WhenItIsNull() throws IOException {
-        var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
-
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
-
-            String responseJson = """
-                {
-                    "model": "voyage-3-large",
-                    "object": "list",
-                    "usage": {
-                        "total_tokens": 5
-                    },
-                    "data": [
-                        {
-                            "object": "embedding",
-                            "index": 0,
-                            "embedding": [
-                                0.123,
-                                -0.123
-                            ]
-                        }
-                    ]
-                }
-                """;
-            webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
-
-            var model = VoyageAIEmbeddingsModelTests.createModel(
-                getUrl(webServer),
-                "secret",
-                VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                10,
-                1,
-                "voyage-3-large",
-                (SimilarityMeasure) null
-            );
-            PlainActionFuture<Model> listener = new PlainActionFuture<>();
-            service.checkModelConfig(model, listener);
-            var result = listener.actionGet(TIMEOUT);
-
-            MatcherAssert.assertThat(
-                result,
-                // the dimension is set to 2 because there are 2 embeddings returned from the mock server
-                is(
-                    VoyageAIEmbeddingsModelTests.createModel(
-                        getUrl(webServer),
-                        "secret",
-                        VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                        10,
-                        2,
-                        "voyage-3-large",
-                        SimilarityMeasure.DOT_PRODUCT
-                    )
-                )
-            );
-        }
-    }
-
-    public void testCheckModelConfig_DoesNotUpdateSimilarity_WhenItIsSpecifiedAsCosine() throws IOException {
-        var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
-
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
-
-            String responseJson = """
-                {
-                    "model": "voyage-3-large",
-                    "object": "list",
-                    "usage": {
-                        "total_tokens": 5
-                    },
-                    "data": [
-                        {
-                            "object": "embedding",
-                            "index": 0,
-                            "embedding": [
-                                0.123,
-                                -0.123
-                            ]
-                        }
-                    ]
-                }
-                """;
-            webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
-
-            var model = VoyageAIEmbeddingsModelTests.createModel(
-                getUrl(webServer),
-                "secret",
-                VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                10,
-                1,
-                "voyage-3-large",
-                SimilarityMeasure.COSINE
-            );
-            PlainActionFuture<Model> listener = new PlainActionFuture<>();
-            service.checkModelConfig(model, listener);
-            var result = listener.actionGet(TIMEOUT);
-
-            MatcherAssert.assertThat(
-                result,
-                // the dimension is set to 2 because there are 2 embeddings returned from the mock server
-                is(
-                    VoyageAIEmbeddingsModelTests.createModel(
-                        getUrl(webServer),
-                        "secret",
-                        VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                        10,
-                        2,
-                        "voyage-3-large",
-                        SimilarityMeasure.COSINE
-                    )
-                )
-            );
-        }
+        verify(sender, times(1)).close();
+        verifyNoMoreInteractions(factory);
+        verifyNoMoreInteractions(sender);
     }
 
     public void testUpdateModelWithEmbeddingDetails_NullSimilarityInOriginalModel() throws IOException {
@@ -973,7 +810,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     private void testUpdateModelWithEmbeddingDetails_Successful(SimilarityMeasure similarityMeasure) throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             var embeddingSize = randomNonNegativeInt();
             var model = VoyageAIEmbeddingsModelTests.createModel(
                 randomAlphaOfLength(10),
@@ -998,7 +835,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     public void testInfer_Embedding_UnauthorisedResponse() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1020,6 +857,8 @@ public class VoyageAIServiceTests extends ESTestCase {
             service.infer(
                 model,
                 null,
+                null,
+                null,
                 List.of("abc"),
                 false,
                 new HashMap<>(),
@@ -1038,7 +877,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     public void testInfer_Rerank_UnauthorisedResponse() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1052,6 +891,8 @@ public class VoyageAIServiceTests extends ESTestCase {
             service.infer(
                 model,
                 "query",
+                null,
+                null,
                 List.of("candidate1", "candidate2"),
                 false,
                 new HashMap<>(),
@@ -1070,7 +911,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     public void testInfer_Embedding_Get_Response_Ingest() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1105,6 +946,8 @@ public class VoyageAIServiceTests extends ESTestCase {
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
+                null,
+                null,
                 null,
                 List.of("abc"),
                 false,
@@ -1150,7 +993,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     public void testInfer_Embedding_Get_Response_Search() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1185,6 +1028,8 @@ public class VoyageAIServiceTests extends ESTestCase {
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
+                null,
+                null,
                 null,
                 List.of("abc"),
                 false,
@@ -1227,62 +1072,10 @@ public class VoyageAIServiceTests extends ESTestCase {
         }
     }
 
-    public void testInfer_Embedding_Get_Response_clustering() throws IOException {
-        var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
-
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
-
-            String responseJson = """
-                {"model":"voyage-3-large","object":"list","usage":{"total_tokens":5},
-                "data":[{"object":"embedding","index":0,"embedding":[0.123, -0.123]}]}
-                """;
-            webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
-
-            var model = VoyageAIEmbeddingsModelTests.createModel(
-                getUrl(webServer),
-                "secret",
-                VoyageAIEmbeddingsTaskSettings.EMPTY_SETTINGS,
-                1024,
-                1024,
-                "voyage-3-large",
-                (SimilarityMeasure) null
-            );
-            PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
-            service.infer(
-                model,
-                null,
-                List.of("abc"),
-                false,
-                new HashMap<>(),
-                InputType.CLUSTERING,
-                InferenceAction.Request.DEFAULT_TIMEOUT,
-                listener
-            );
-
-            var result = listener.actionGet(TIMEOUT);
-
-            assertEquals(buildExpectationFloat(List.of(new float[] { 0.123F, -0.123F })), result.asMap());
-
-            MatcherAssert.assertThat(webServer.requests(), hasSize(1));
-            assertNull(webServer.requests().getFirst().getUri().getQuery());
-            MatcherAssert.assertThat(
-                webServer.requests().getFirst().getHeader(HttpHeaders.CONTENT_TYPE),
-                equalTo(XContentType.JSON.mediaType())
-            );
-            MatcherAssert.assertThat(webServer.requests().getFirst().getHeader(HttpHeaders.AUTHORIZATION), equalTo("Bearer secret"));
-
-            var requestMap = entityAsMap(webServer.requests().getFirst().getBody());
-            MatcherAssert.assertThat(
-                requestMap,
-                is(Map.of("input", List.of("abc"), "model", "voyage-3-large", "output_dtype", "float", "output_dimension", 1024))
-            );
-        }
-    }
-
     public void testInfer_Embedding_Get_Response_NullInputType() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1315,7 +1108,18 @@ public class VoyageAIServiceTests extends ESTestCase {
                 (SimilarityMeasure) null
             );
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
-            service.infer(model, null, List.of("abc"), false, new HashMap<>(), null, InferenceAction.Request.DEFAULT_TIMEOUT, listener);
+            service.infer(
+                model,
+                null,
+                null,
+                null,
+                List.of("abc"),
+                false,
+                new HashMap<>(),
+                null,
+                InferenceAction.Request.DEFAULT_TIMEOUT,
+                listener
+            );
 
             var result = listener.actionGet(TIMEOUT);
 
@@ -1363,13 +1167,15 @@ public class VoyageAIServiceTests extends ESTestCase {
             """;
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
             var model = VoyageAIRerankModelTests.createModel(getUrl(webServer), "secret", "model", null, false, false);
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
                 "query",
+                null,
+                null,
                 List.of("candidate1", "candidate2", "candidate3"),
                 false,
                 new HashMap<>(),
@@ -1449,13 +1255,15 @@ public class VoyageAIServiceTests extends ESTestCase {
             """;
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
             var model = VoyageAIRerankModelTests.createModel(getUrl(webServer), "secret", "model", 3, false, false);
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
                 "query",
+                null,
+                null,
                 List.of("candidate1", "candidate2", "candidate3", "candidate4"),
                 false,
                 new HashMap<>(),
@@ -1541,13 +1349,15 @@ public class VoyageAIServiceTests extends ESTestCase {
             """;
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
             var model = VoyageAIRerankModelTests.createModel(getUrl(webServer), "secret", "model", null, null, null);
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
                 "query",
+                null,
+                null,
                 List.of("candidate1", "candidate2", "candidate3"),
                 false,
                 new HashMap<>(),
@@ -1617,13 +1427,15 @@ public class VoyageAIServiceTests extends ESTestCase {
             """;
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
             webServer.enqueue(new MockResponse().setResponseCode(200).setBody(responseJson));
             var model = VoyageAIRerankModelTests.createModel(getUrl(webServer), "secret", "model", 3, true, true);
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
                 "query",
+                null,
+                null,
                 List.of("candidate1", "candidate2", "candidate3", "candidate4"),
                 false,
                 new HashMap<>(),
@@ -1682,7 +1494,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     public void testInfer_Embedding_DoesNotSetInputType_WhenNotPresentInTaskSettings_AndUnspecifiedIsPassedInRequest() throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             String responseJson = """
                 {
@@ -1717,6 +1529,8 @@ public class VoyageAIServiceTests extends ESTestCase {
             PlainActionFuture<InferenceServiceResults> listener = new PlainActionFuture<>();
             service.infer(
                 model,
+                null,
+                null,
                 null,
                 List.of("abc"),
                 false,
@@ -1789,7 +1603,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     private void test_Embedding_ChunkedInfer_BatchesCalls(VoyageAIEmbeddingsModel model) throws IOException {
         var senderFactory = HttpRequestSenderTests.createSenderFactory(threadPool, clientManager);
 
-        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool))) {
+        try (var service = new VoyageAIService(senderFactory, createWithEmptySettings(threadPool), mockClusterServiceEmpty())) {
 
             // Batching will call the service with 2 input
             String responseJson = """
@@ -1826,7 +1640,7 @@ public class VoyageAIServiceTests extends ESTestCase {
             service.chunkedInfer(
                 model,
                 null,
-                List.of("a", "bb"),
+                List.of(new ChunkInferenceInput("a"), new ChunkInferenceInput("bb")),
                 new HashMap<>(),
                 InputType.UNSPECIFIED,
                 InferenceAction.Request.DEFAULT_TIMEOUT,
@@ -1935,7 +1749,7 @@ public class VoyageAIServiceTests extends ESTestCase {
     }
 
     public void testDoesNotSupportsStreaming() throws IOException {
-        try (var service = new VoyageAIService(mock(), createWithEmptySettings(mock()))) {
+        try (var service = new VoyageAIService(mock(), createWithEmptySettings(mock()), mockClusterServiceEmpty())) {
             assertFalse(service.canStream(TaskType.COMPLETION));
             assertFalse(service.canStream(TaskType.ANY));
         }
@@ -1976,7 +1790,16 @@ public class VoyageAIServiceTests extends ESTestCase {
     }
 
     private VoyageAIService createVoyageAIService() {
-        return new VoyageAIService(mock(HttpRequestSender.Factory.class), createWithEmptySettings(threadPool));
+        return new VoyageAIService(mock(HttpRequestSender.Factory.class), createWithEmptySettings(threadPool), mockClusterServiceEmpty());
     }
 
+    @Override
+    public InferenceService createInferenceService() {
+        return createVoyageAIService();
+    }
+
+    protected void assertRerankerWindowSize(RerankingInferenceService rerankingInferenceService) {
+        assertThat(rerankingInferenceService.rerankerWindowSize("rerank-lite-1"), is(2800));
+        assertThat(rerankingInferenceService.rerankerWindowSize("any other model"), is(5500));
+    }
 }

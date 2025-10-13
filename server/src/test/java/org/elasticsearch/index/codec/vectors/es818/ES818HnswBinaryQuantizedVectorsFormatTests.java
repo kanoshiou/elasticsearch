@@ -22,27 +22,37 @@ package org.elasticsearch.index.codec.vectors.es818;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.FilterCodec;
 import org.apache.lucene.codecs.KnnVectorsFormat;
-import org.apache.lucene.codecs.lucene101.Lucene101Codec;
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
+import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.tests.index.BaseKnnVectorsFormatTestCase;
+import org.apache.lucene.tests.store.MockDirectoryWrapper;
+import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.SameThreadExecutorService;
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.common.logging.LogConfigurator;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Locale;
 
 import static java.lang.String.format;
+import static org.apache.lucene.index.VectorSimilarityFunction.DOT_PRODUCT;
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.oneOf;
@@ -54,14 +64,11 @@ public class ES818HnswBinaryQuantizedVectorsFormatTests extends BaseKnnVectorsFo
         LogConfigurator.configureESLogging(); // native access requires logging to be initialized
     }
 
+    static final Codec codec = TestUtil.alwaysKnnVectorsFormat(new ES818HnswBinaryQuantizedVectorsFormat());
+
     @Override
     protected Codec getCodec() {
-        return new Lucene101Codec() {
-            @Override
-            public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
-                return new ES818HnswBinaryQuantizedVectorsFormat();
-            }
-        };
+        return codec;
     }
 
     public void testToString() {
@@ -86,6 +93,9 @@ public class ES818HnswBinaryQuantizedVectorsFormatTests extends BaseKnnVectorsFo
         for (VectorSimilarityFunction similarityFunction : VectorSimilarityFunction.values()) {
             try (Directory dir = newDirectory(); IndexWriter w = new IndexWriter(dir, newIndexWriterConfig())) {
                 Document doc = new Document();
+                if (similarityFunction == VectorSimilarityFunction.COSINE) {
+                    VectorUtil.l2normalize(vector);
+                }
                 doc.add(new KnnFloatVectorField("f", vector, similarityFunction));
                 w.addDocument(doc);
                 w.commit();
@@ -98,8 +108,17 @@ public class ES818HnswBinaryQuantizedVectorsFormatTests extends BaseKnnVectorsFo
                         assertArrayEquals(vector, vectorValues.vectorValue(docIndexIterator.index()), 0.00001f);
                     }
                     float[] randomVector = randomVector(vector.length);
+                    if (similarityFunction == VectorSimilarityFunction.COSINE) {
+                        VectorUtil.l2normalize(randomVector);
+                    }
                     float trueScore = similarityFunction.compare(vector, randomVector);
-                    TopDocs td = r.searchNearestVectors("f", randomVector, 1, null, Integer.MAX_VALUE);
+                    TopDocs td = r.searchNearestVectors(
+                        "f",
+                        randomVector,
+                        1,
+                        AcceptDocs.fromLiveDocs(r.getLiveDocs(), r.maxDoc()),
+                        Integer.MAX_VALUE
+                    );
                     assertEquals(1, td.totalHits.value());
                     assertTrue(td.scoreDocs[0].score >= 0);
                     // When it's the only vector in a segment, the score should be very close to the true score
@@ -128,5 +147,52 @@ public class ES818HnswBinaryQuantizedVectorsFormatTests extends BaseKnnVectorsFo
         // differences should be considered carefully.
         var expectedValues = Arrays.stream(VectorSimilarityFunction.values()).toList();
         assertEquals(Lucene99HnswVectorsReader.SIMILARITY_FUNCTIONS, expectedValues);
+    }
+
+    public void testSimpleOffHeapSize() throws IOException {
+        try (Directory dir = newDirectory()) {
+            testSimpleOffHeapSizeImpl(dir, newIndexWriterConfig(), true);
+        }
+    }
+
+    public void testSimpleOffHeapSizeMMapDir() throws IOException {
+        try (Directory dir = newMMapDirectory()) {
+            testSimpleOffHeapSizeImpl(dir, newIndexWriterConfig(), true);
+        }
+    }
+
+    public void testSimpleOffHeapSizeImpl(Directory dir, IndexWriterConfig config, boolean expectVecOffHeap) throws IOException {
+        float[] vector = randomVector(random().nextInt(12, 500));
+        try (IndexWriter w = new IndexWriter(dir, config)) {
+            Document doc = new Document();
+            doc.add(new KnnFloatVectorField("f", vector, DOT_PRODUCT));
+            w.addDocument(doc);
+            w.commit();
+            try (IndexReader reader = DirectoryReader.open(w)) {
+                LeafReader r = getOnlyLeafReader(reader);
+                if (r instanceof CodecReader codecReader) {
+                    KnnVectorsReader knnVectorsReader = codecReader.getVectorReader();
+                    if (knnVectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader fieldsReader) {
+                        knnVectorsReader = fieldsReader.getFieldReader("f");
+                    }
+                    var fieldInfo = r.getFieldInfos().fieldInfo("f");
+                    var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
+                    assertEquals(expectVecOffHeap ? 3 : 2, offHeap.size());
+                    assertEquals(1L, (long) offHeap.get("vex"));
+                    assertTrue(offHeap.get("veb") > 0L);
+                    if (expectVecOffHeap) {
+                        assertEquals(vector.length * Float.BYTES, (long) offHeap.get("vec"));
+                    }
+                }
+            }
+        }
+    }
+
+    static Directory newMMapDirectory() throws IOException {
+        Directory dir = new MMapDirectory(createTempDir("ES818BinaryQuantizedVectorsFormatTests"));
+        if (random().nextBoolean()) {
+            dir = new MockDirectoryWrapper(random(), dir);
+        }
+        return dir;
     }
 }

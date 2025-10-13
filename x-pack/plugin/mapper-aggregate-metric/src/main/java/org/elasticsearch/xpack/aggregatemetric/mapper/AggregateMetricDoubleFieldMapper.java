@@ -34,6 +34,7 @@ import org.elasticsearch.index.mapper.CompositeSyntheticFieldLoader;
 import org.elasticsearch.index.mapper.DocumentParserContext;
 import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.mapper.IgnoreMalformedStoredValues;
+import org.elasticsearch.index.mapper.IndexType;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.Mapper;
 import org.elasticsearch.index.mapper.MapperBuilderContext;
@@ -168,8 +169,15 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
 
         private final IndexVersion indexCreatedVersion;
         private final IndexMode indexMode;
+        private final SourceKeepMode indexSourceKeepMode;
 
-        public Builder(String name, Boolean ignoreMalformedByDefault, IndexVersion indexCreatedVersion, IndexMode mode) {
+        public Builder(
+            String name,
+            Boolean ignoreMalformedByDefault,
+            IndexVersion indexCreatedVersion,
+            IndexMode mode,
+            SourceKeepMode indexSourceKeepMode
+        ) {
             super(name);
             this.ignoreMalformed = Parameter.boolParam(
                 Names.IGNORE_MALFORMED,
@@ -181,6 +189,7 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
             this.timeSeriesMetric = TimeSeriesParams.metricParam(m -> toType(m).metricType, MetricType.GAUGE);
             this.indexCreatedVersion = Objects.requireNonNull(indexCreatedVersion);
             this.indexMode = mode;
+            this.indexSourceKeepMode = indexSourceKeepMode;
         }
 
         @Override
@@ -238,7 +247,8 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
                         false,
                         false,
                         indexCreatedVersion,
-                        indexMode
+                        indexMode,
+                        indexSourceKeepMode
                     ).allowMultipleValues(false);
                 } else {
                     builder = new NumberFieldMapper.Builder(
@@ -248,7 +258,8 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
                         false,
                         true,
                         indexCreatedVersion,
-                        indexMode
+                        indexMode,
+                        indexSourceKeepMode
                     ).allowMultipleValues(false);
                 }
                 NumberFieldMapper fieldMapper = builder.build(context);
@@ -274,7 +285,13 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
     }
 
     public static final FieldMapper.TypeParser PARSER = new TypeParser(
-        (n, c) -> new Builder(n, IGNORE_MALFORMED_SETTING.get(c.getSettings()), c.indexVersionCreated(), c.getIndexSettings().getMode()),
+        (n, c) -> new Builder(
+            n,
+            IGNORE_MALFORMED_SETTING.get(c.getSettings()),
+            c.indexVersionCreated(),
+            c.getIndexSettings().getMode(),
+            c.getIndexSettings().sourceKeepMode()
+        ),
         notInMultiFields(CONTENT_TYPE)
     );
 
@@ -291,7 +308,7 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
         }
 
         public AggregateMetricDoubleFieldType(String name, Map<String, String> meta, MetricType metricType) {
-            super(name, true, false, true, TextSearchInfo.SIMPLE_MATCH_WITHOUT_TERMS, meta);
+            super(name, IndexType.points(true, true), false, meta);
             this.metricType = metricType;
         }
 
@@ -314,6 +331,11 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
         @Override
         public String typeName() {
             return CONTENT_TYPE;
+        }
+
+        @Override
+        public TextSearchInfo getTextSearchInfo() {
+            return TextSearchInfo.SIMPLE_MATCH_WITHOUT_TERMS;
         }
 
         private void setMetricFields(EnumMap<Metric, NumberFieldMapper.NumberFieldType> metricFields) {
@@ -555,20 +577,24 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
                     }
 
                     @Override
-                    public Block read(BlockFactory factory, Docs docs) throws IOException {
-                        try (var builder = factory.aggregateMetricDoubleBuilder(docs.count())) {
-                            copyDoubleValuesToBuilder(docs, builder.min(), minValues);
-                            copyDoubleValuesToBuilder(docs, builder.max(), maxValues);
-                            copyDoubleValuesToBuilder(docs, builder.sum(), sumValues);
-                            copyIntValuesToBuilder(docs, builder.count(), valueCountValues);
+                    public Block read(BlockFactory factory, Docs docs, int offset, boolean nullsFiltered) throws IOException {
+                        try (var builder = factory.aggregateMetricDoubleBuilder(docs.count() - offset)) {
+                            copyDoubleValuesToBuilder(docs, offset, builder.min(), minValues);
+                            copyDoubleValuesToBuilder(docs, offset, builder.max(), maxValues);
+                            copyDoubleValuesToBuilder(docs, offset, builder.sum(), sumValues);
+                            copyIntValuesToBuilder(docs, offset, builder.count(), valueCountValues);
                             return builder.build();
                         }
                     }
 
-                    private void copyDoubleValuesToBuilder(Docs docs, BlockLoader.DoubleBuilder builder, NumericDocValues values)
-                        throws IOException {
+                    private void copyDoubleValuesToBuilder(
+                        Docs docs,
+                        int offset,
+                        BlockLoader.DoubleBuilder builder,
+                        NumericDocValues values
+                    ) throws IOException {
                         int lastDoc = -1;
-                        for (int i = 0; i < docs.count(); i++) {
+                        for (int i = offset; i < docs.count(); i++) {
                             int doc = docs.get(i);
                             if (doc < lastDoc) {
                                 throw new IllegalStateException("docs within same block must be in order");
@@ -584,10 +610,10 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
                         }
                     }
 
-                    private void copyIntValuesToBuilder(Docs docs, BlockLoader.IntBuilder builder, NumericDocValues values)
+                    private void copyIntValuesToBuilder(Docs docs, int offset, BlockLoader.IntBuilder builder, NumericDocValues values)
                         throws IOException {
                         int lastDoc = -1;
-                        for (int i = 0; i < docs.count(); i++) {
+                        for (int i = offset; i < docs.count(); i++) {
                             int doc = docs.get(i);
                             if (doc < lastDoc) {
                                 throw new IllegalStateException("docs within same block must be in order");
@@ -611,22 +637,22 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
                     }
 
                     private void readSingleRow(int docId, AggregateMetricDoubleBuilder builder) throws IOException {
-                        if (minValues.advanceExact(docId)) {
+                        if (minValues != null && minValues.advanceExact(docId)) {
                             builder.min().appendDouble(NumericUtils.sortableLongToDouble(minValues.longValue()));
                         } else {
                             builder.min().appendNull();
                         }
-                        if (maxValues.advanceExact(docId)) {
+                        if (maxValues != null && maxValues.advanceExact(docId)) {
                             builder.max().appendDouble(NumericUtils.sortableLongToDouble(maxValues.longValue()));
                         } else {
                             builder.max().appendNull();
                         }
-                        if (sumValues.advanceExact(docId)) {
+                        if (sumValues != null && sumValues.advanceExact(docId)) {
                             builder.sum().appendDouble(NumericUtils.sortableLongToDouble(sumValues.longValue()));
                         } else {
                             builder.sum().appendNull();
                         }
-                        if (valueCountValues.advanceExact(docId)) {
+                        if (valueCountValues != null && valueCountValues.advanceExact(docId)) {
                             builder.count().appendInt(Math.toIntExact(valueCountValues.longValue()));
                         } else {
                             builder.count().appendNull();
@@ -673,6 +699,7 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
     private final TimeSeriesParams.MetricType metricType;
 
     private final IndexMode indexMode;
+    private final SourceKeepMode indexSourceKeepMode;
 
     private AggregateMetricDoubleFieldMapper(
         String simpleName,
@@ -690,6 +717,7 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
         this.metricType = builder.timeSeriesMetric.getValue();
         this.indexCreatedVersion = builder.indexCreatedVersion;
         this.indexMode = builder.indexMode;
+        this.indexSourceKeepMode = builder.indexSourceKeepMode;
     }
 
     @Override
@@ -833,6 +861,7 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
             // by its FieldMapper#parse()
             throw e;
         }
+
         for (Map.Entry<Metric, Number> parsed : metricsParsed.entrySet()) {
             NumberFieldMapper delegateFieldMapper = metricFieldMappers.get(parsed.getKey());
             delegateFieldMapper.indexValue(context, parsed.getValue());
@@ -842,7 +871,8 @@ public class AggregateMetricDoubleFieldMapper extends FieldMapper {
 
     @Override
     public FieldMapper.Builder getMergeBuilder() {
-        return new Builder(leafName(), ignoreMalformedByDefault, indexCreatedVersion, indexMode).metric(metricType).init(this);
+        return new Builder(leafName(), ignoreMalformedByDefault, indexCreatedVersion, indexMode, indexSourceKeepMode).metric(metricType)
+            .init(this);
     }
 
     @Override

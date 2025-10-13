@@ -19,6 +19,7 @@ import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.AbstractScalarFunctionTestCase;
 import org.elasticsearch.xpack.esql.expression.function.TestCaseSupplier;
+import org.elasticsearch.xpack.esql.type.EsqlDataTypeConverter;
 
 import java.math.BigInteger;
 import java.time.Instant;
@@ -34,6 +35,7 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         this.testCase = testCaseSupplier.get();
     }
 
+    @SuppressWarnings("unchecked")
     @ParametersFactory
     public static Iterable<Object[]> parameters() {
         // TODO multivalue fields
@@ -41,7 +43,7 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         List<TestCaseSupplier> suppliers = new ArrayList<>();
         TestCaseSupplier.forUnaryInt(
             suppliers,
-            "ToStringFromIntEvaluator[field=" + read + "]",
+            "ToStringFromIntEvaluator[integer=" + read + "]",
             DataType.KEYWORD,
             i -> new BytesRef(Integer.toString(i)),
             Integer.MIN_VALUE,
@@ -50,7 +52,7 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         );
         TestCaseSupplier.forUnaryLong(
             suppliers,
-            "ToStringFromLongEvaluator[field=" + read + "]",
+            "ToStringFromLongEvaluator[lng=" + read + "]",
             DataType.KEYWORD,
             l -> new BytesRef(Long.toString(l)),
             Long.MIN_VALUE,
@@ -59,7 +61,7 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         );
         TestCaseSupplier.forUnaryUnsignedLong(
             suppliers,
-            "ToStringFromUnsignedLongEvaluator[field=" + read + "]",
+            "ToStringFromUnsignedLongEvaluator[lng=" + read + "]",
             DataType.KEYWORD,
             ul -> new BytesRef(ul.toString()),
             BigInteger.ZERO,
@@ -68,31 +70,39 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         );
         TestCaseSupplier.forUnaryDouble(
             suppliers,
-            "ToStringFromDoubleEvaluator[field=" + read + "]",
+            "ToStringFromDoubleEvaluator[dbl=" + read + "]",
             DataType.KEYWORD,
             d -> new BytesRef(Double.toString(d)),
             Double.NEGATIVE_INFINITY,
             Double.POSITIVE_INFINITY,
             List.of()
         );
+        TestCaseSupplier.forUnaryDenseVector(
+            suppliers,
+            "ToStringFromFloatEvaluator[flt=" + read + "]",
+            DataType.KEYWORD,
+            d -> d.stream().map(f -> new BytesRef(f.toString())).toList(),
+            -1.0f,
+            1.0f
+        );
         TestCaseSupplier.forUnaryBoolean(
             suppliers,
-            "ToStringFromBooleanEvaluator[field=" + read + "]",
+            "ToStringFromBooleanEvaluator[bool=" + read + "]",
             DataType.KEYWORD,
             b -> new BytesRef(b.toString()),
             List.of()
         );
         TestCaseSupplier.unary(
             suppliers,
-            "ToStringFromDatetimeEvaluator[field=" + read + "]",
+            "ToStringFromDatetimeEvaluator[datetime=" + read + "]",
             TestCaseSupplier.dateCases(),
             DataType.KEYWORD,
-            i -> new BytesRef(DateFieldMapper.DEFAULT_DATE_TIME_FORMATTER.formatMillis(((Instant) i).toEpochMilli())),
+            i -> new BytesRef(DateFieldMapper.DEFAULT_DATE_TIME_FORMATTER.formatMillis(DateUtils.toLongMillis((Instant) i))),
             List.of()
         );
         TestCaseSupplier.unary(
             suppliers,
-            "ToStringFromDateNanosEvaluator[field=" + read + "]",
+            "ToStringFromDateNanosEvaluator[datetime=" + read + "]",
             TestCaseSupplier.dateNanosCases(),
             DataType.KEYWORD,
             i -> new BytesRef(DateFieldMapper.DEFAULT_DATE_TIME_NANOS_FORMATTER.formatNanos(DateUtils.toLong((Instant) i))),
@@ -100,35 +110,35 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         );
         TestCaseSupplier.forUnaryGeoPoint(
             suppliers,
-            "ToStringFromGeoPointEvaluator[field=" + read + "]",
+            "ToStringFromGeoPointEvaluator[wkb=" + read + "]",
             DataType.KEYWORD,
             wkb -> new BytesRef(GEO.wkbToWkt(wkb)),
             List.of()
         );
         TestCaseSupplier.forUnaryCartesianPoint(
             suppliers,
-            "ToStringFromCartesianPointEvaluator[field=" + read + "]",
+            "ToStringFromCartesianPointEvaluator[wkb=" + read + "]",
             DataType.KEYWORD,
             wkb -> new BytesRef(CARTESIAN.wkbToWkt(wkb)),
             List.of()
         );
         TestCaseSupplier.forUnaryGeoShape(
             suppliers,
-            "ToStringFromGeoShapeEvaluator[field=" + read + "]",
+            "ToStringFromGeoShapeEvaluator[wkb=" + read + "]",
             DataType.KEYWORD,
             wkb -> new BytesRef(GEO.wkbToWkt(wkb)),
             List.of()
         );
         TestCaseSupplier.forUnaryCartesianShape(
             suppliers,
-            "ToStringFromCartesianShapeEvaluator[field=" + read + "]",
+            "ToStringFromCartesianShapeEvaluator[wkb=" + read + "]",
             DataType.KEYWORD,
             wkb -> new BytesRef(CARTESIAN.wkbToWkt(wkb)),
             List.of()
         );
         TestCaseSupplier.forUnaryIp(
             suppliers,
-            "ToStringFromIPEvaluator[field=" + read + "]",
+            "ToStringFromIPEvaluator[ip=" + read + "]",
             DataType.KEYWORD,
             ip -> new BytesRef(DocValueFormat.IP.format(ip)),
             List.of()
@@ -136,9 +146,27 @@ public class ToStringTests extends AbstractScalarFunctionTestCase {
         TestCaseSupplier.forUnaryStrings(suppliers, read, DataType.KEYWORD, bytesRef -> bytesRef, List.of());
         TestCaseSupplier.forUnaryVersion(
             suppliers,
-            "ToStringFromVersionEvaluator[field=" + read + "]",
+            "ToStringFromVersionEvaluator[version=" + read + "]",
             DataType.KEYWORD,
             v -> new BytesRef(v.toString()),
+            List.of()
+        );
+        // Geo-Grid types
+        for (DataType gridType : new DataType[] { DataType.GEOHASH, DataType.GEOTILE, DataType.GEOHEX }) {
+            TestCaseSupplier.forUnaryGeoGrid(
+                suppliers,
+                "ToStringFromGeoGridEvaluator[gridId=Attribute[channel=0], dataType=" + gridType + "]",
+                gridType,
+                DataType.KEYWORD,
+                v -> new BytesRef(EsqlDataTypeConverter.geoGridToString((long) v, gridType)),
+                List.of()
+            );
+        }
+        TestCaseSupplier.forUnaryAggregateMetricDouble(
+            suppliers,
+            "ToStringFromAggregateMetricDoubleEvaluator[field=" + read + "]",
+            DataType.KEYWORD,
+            agg -> new BytesRef(EsqlDataTypeConverter.aggregateMetricDoubleLiteralToString(agg)),
             List.of()
         );
         return parameterSuppliersFromTypedDataWithDefaultChecksNoErrors(true, suppliers);

@@ -206,11 +206,7 @@ public final class InternalAutoDateHistogram extends InternalMultiBucketAggregat
         format = in.readNamedWriteable(DocValueFormat.class);
         buckets = in.readCollectionAsList(stream -> Bucket.readFrom(stream, format));
         this.targetBuckets = in.readVInt();
-        if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_3_0)) {
-            bucketInnerInterval = in.readVLong();
-        } else {
-            bucketInnerInterval = 1; // Calculated on merge.
-        }
+        bucketInnerInterval = in.readVLong();
         // we changed the order format in 8.13 for partial reduce, therefore we need to order them to perform merge sort
         if (in.getTransportVersion().between(TransportVersions.V_8_13_0, TransportVersions.V_8_14_0)) {
             // list is mutable by #readCollectionAsList contract
@@ -224,9 +220,7 @@ public final class InternalAutoDateHistogram extends InternalMultiBucketAggregat
         out.writeNamedWriteable(format);
         out.writeCollection(buckets);
         out.writeVInt(targetBuckets);
-        if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_3_0)) {
-            out.writeVLong(bucketInnerInterval);
-        }
+        out.writeVLong(bucketInnerInterval);
     }
 
     long getBucketInnerInterval() {
@@ -532,15 +526,11 @@ public final class InternalAutoDateHistogram extends InternalMultiBucketAggregat
 
     @Override
     public InternalAggregation finalizeSampling(SamplingContext samplingContext) {
-        return new InternalAutoDateHistogram(
-            getName(),
-            buckets.stream().map(b -> b.finalizeSampling(samplingContext)).toList(),
-            targetBuckets,
-            bucketInfo,
-            format,
-            getMetadata(),
-            bucketInnerInterval
-        );
+        final List<Bucket> buckets = new ArrayList<>(this.buckets);
+        for (int i = 0; i < buckets.size(); i++) {
+            buckets.set(i, buckets.get(i).finalizeSampling(samplingContext));
+        }
+        return new InternalAutoDateHistogram(getName(), buckets, targetBuckets, bucketInfo, format, getMetadata(), bucketInnerInterval);
     }
 
     private BucketReduceResult maybeMergeConsecutiveBuckets(BucketReduceResult current, AggregationReduceContext reduceContext) {

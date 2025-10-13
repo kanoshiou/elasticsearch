@@ -18,7 +18,9 @@ import org.elasticsearch.common.logging.DeprecationLogger;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.LazyInitializable;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.inference.ChunkInferenceInput;
 import org.elasticsearch.inference.ChunkedInference;
 import org.elasticsearch.inference.ChunkingSettings;
 import org.elasticsearch.inference.InferenceResults;
@@ -29,6 +31,7 @@ import org.elasticsearch.inference.InputType;
 import org.elasticsearch.inference.MinimalServiceSettings;
 import org.elasticsearch.inference.Model;
 import org.elasticsearch.inference.ModelConfigurations;
+import org.elasticsearch.inference.RerankingInferenceService;
 import org.elasticsearch.inference.SettingsConfiguration;
 import org.elasticsearch.inference.TaskType;
 import org.elasticsearch.inference.UnifiedCompletionRequest;
@@ -55,6 +58,7 @@ import org.elasticsearch.xpack.core.ml.inference.trainedmodel.TextSimilarityConf
 import org.elasticsearch.xpack.core.ml.inference.trainedmodel.TextSimilarityConfigUpdate;
 import org.elasticsearch.xpack.inference.chunking.ChunkingSettingsBuilder;
 import org.elasticsearch.xpack.inference.chunking.EmbeddingRequestChunker;
+import org.elasticsearch.xpack.inference.chunking.RerankRequestChunker;
 import org.elasticsearch.xpack.inference.services.ConfigurationParseContext;
 import org.elasticsearch.xpack.inference.services.ServiceUtils;
 
@@ -82,12 +86,12 @@ import static org.elasticsearch.xpack.inference.services.elasticsearch.Elasticse
 import static org.elasticsearch.xpack.inference.services.elasticsearch.ElserModels.ELSER_V2_MODEL;
 import static org.elasticsearch.xpack.inference.services.elasticsearch.ElserModels.ELSER_V2_MODEL_LINUX_X86;
 
-public class ElasticsearchInternalService extends BaseElasticsearchInternalService {
+public class ElasticsearchInternalService extends BaseElasticsearchInternalService implements RerankingInferenceService {
 
     public static final String NAME = "elasticsearch";
     public static final String OLD_ELSER_SERVICE_NAME = "elser";
 
-    static final String MULTILINGUAL_E5_SMALL_MODEL_ID = ".multilingual-e5-small";
+    public static final String MULTILINGUAL_E5_SMALL_MODEL_ID = ".multilingual-e5-small";
     static final String MULTILINGUAL_E5_SMALL_MODEL_ID_LINUX_X86 = ".multilingual-e5-small_linux-x86_64";
     public static final Set<String> MULTILINGUAL_E5_SMALL_VALID_IDS = Set.of(
         MULTILINGUAL_E5_SMALL_MODEL_ID,
@@ -110,6 +114,13 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
 
     private static final Logger logger = LogManager.getLogger(ElasticsearchInternalService.class);
     private static final DeprecationLogger DEPRECATION_LOGGER = DeprecationLogger.getLogger(ElasticsearchInternalService.class);
+
+    /**
+     * Fix for https://github.com/elastic/elasticsearch/issues/124675
+     * In 8.13.0 we transitioned from model_version to model_id. Any elser inference endpoints created prior to 8.13.0 will still use
+     * service_settings.model_version.
+     */
+    private static final String OLD_MODEL_ID_FIELD_NAME = "model_version";
 
     private final Settings settings;
 
@@ -339,19 +350,13 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         ActionListener<Model> modelListener
     ) {
 
-        var esServiceSettingsBuilder = ElasticsearchInternalServiceSettings.fromRequestMap(serviceSettingsMap);
+        var serviceSettings = ElasticRerankerServiceSettings.fromMap(serviceSettingsMap);
 
         throwIfNotEmptyMap(config, name());
         throwIfNotEmptyMap(serviceSettingsMap, name());
 
         modelListener.onResponse(
-            new ElasticRerankerModel(
-                inferenceEntityId,
-                taskType,
-                NAME,
-                new ElasticRerankerServiceSettings(esServiceSettingsBuilder.build()),
-                RerankTaskSettings.fromMap(taskSettingsMap)
-            )
+            new ElasticRerankerModel(inferenceEntityId, taskType, NAME, serviceSettings, RerankTaskSettings.fromMap(taskSettingsMap))
         );
     }
 
@@ -489,6 +494,8 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         Map<String, Object> serviceSettingsMap = removeFromMapOrThrowIfNull(config, ModelConfigurations.SERVICE_SETTINGS);
         Map<String, Object> taskSettingsMap = removeFromMapOrDefaultEmpty(config, ModelConfigurations.TASK_SETTINGS);
 
+        migrateModelVersionToModelId(serviceSettingsMap);
+
         ChunkingSettings chunkingSettings = null;
         if (TaskType.TEXT_EMBEDDING.equals(taskType) || TaskType.SPARSE_EMBEDDING.equals(taskType)) {
             chunkingSettings = ChunkingSettingsBuilder.fromMap(removeFromMap(config, ModelConfigurations.CHUNKING_SETTINGS));
@@ -496,7 +503,9 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
 
         String modelId = (String) serviceSettingsMap.get(MODEL_ID);
         if (modelId == null) {
-            throw new IllegalArgumentException("Error parsing request config, model id is missing");
+            throw new IllegalArgumentException(
+                Strings.format("Error parsing request config, model id is missing for inference id: %s", inferenceEntityId)
+            );
         }
 
         if (MULTILINGUAL_E5_SMALL_VALID_IDS.contains(modelId)) {
@@ -521,7 +530,7 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
                 inferenceEntityId,
                 taskType,
                 NAME,
-                new ElasticRerankerServiceSettings(ElasticsearchInternalServiceSettings.fromPersistedMap(serviceSettingsMap)),
+                ElasticRerankerServiceSettings.fromMap(serviceSettingsMap),
                 RerankTaskSettings.fromMap(taskSettingsMap)
             );
         } else {
@@ -536,50 +545,45 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         }
     }
 
-    @Override
-    public void checkModelConfig(Model model, ActionListener<Model> listener) {
-        if (model instanceof CustomElandEmbeddingModel elandModel && elandModel.getTaskType() == TaskType.TEXT_EMBEDDING) {
-            // At this point the inference endpoint configuration has not been persisted yet, if we attempt to do inference using the
-            // inference id we'll get an error because the trained model code needs to use the persisted inference endpoint to retrieve the
-            // model id. To get around this we'll have the getEmbeddingSize() method use the model id instead of inference id. So we need
-            // to create a temporary model that overrides the inference id with the model id.
-            var temporaryModelWithModelId = new CustomElandEmbeddingModel(
-                elandModel.getServiceSettings().modelId(),
-                elandModel.getTaskType(),
-                elandModel.getConfigurations().getService(),
-                elandModel.getServiceSettings(),
-                elandModel.getConfigurations().getChunkingSettings()
-            );
-
-            ServiceUtils.getEmbeddingSize(
-                temporaryModelWithModelId,
-                this,
-                listener.delegateFailureAndWrap((l, size) -> l.onResponse(updateModelWithEmbeddingDetails(elandModel, size)))
-            );
-        } else {
-            listener.onResponse(model);
+    /**
+     * Fix for https://github.com/elastic/elasticsearch/issues/124675
+     * In 8.13.0 we transitioned from model_version to model_id. Any elser inference endpoints created prior to 8.13.0 will still use
+     * service_settings.model_version. We need to look for that key and migrate it to model_id.
+     */
+    private void migrateModelVersionToModelId(Map<String, Object> serviceSettingsMap) {
+        if (serviceSettingsMap.containsKey(OLD_MODEL_ID_FIELD_NAME)) {
+            String modelId = ServiceUtils.removeAsType(serviceSettingsMap, OLD_MODEL_ID_FIELD_NAME, String.class);
+            serviceSettingsMap.put(ElserInternalServiceSettings.MODEL_ID, modelId);
         }
     }
 
-    private static CustomElandEmbeddingModel updateModelWithEmbeddingDetails(CustomElandEmbeddingModel model, int embeddingSize) {
-        CustomElandInternalTextEmbeddingServiceSettings serviceSettings = new CustomElandInternalTextEmbeddingServiceSettings(
-            model.getServiceSettings().getNumAllocations(),
-            model.getServiceSettings().getNumThreads(),
-            model.getServiceSettings().modelId(),
-            model.getServiceSettings().getAdaptiveAllocationsSettings(),
-            model.getServiceSettings().getDeploymentId(),
-            embeddingSize,
-            model.getServiceSettings().similarity(),
-            model.getServiceSettings().elementType()
-        );
+    @Override
+    public Model updateModelWithEmbeddingDetails(Model model, int embeddingSize) {
+        if (model instanceof CustomElandEmbeddingModel customElandEmbeddingModel && model.getTaskType() == TaskType.TEXT_EMBEDDING) {
+            CustomElandInternalTextEmbeddingServiceSettings serviceSettings = new CustomElandInternalTextEmbeddingServiceSettings(
+                customElandEmbeddingModel.getServiceSettings().getNumAllocations(),
+                customElandEmbeddingModel.getServiceSettings().getNumThreads(),
+                customElandEmbeddingModel.getServiceSettings().modelId(),
+                customElandEmbeddingModel.getServiceSettings().getAdaptiveAllocationsSettings(),
+                customElandEmbeddingModel.getServiceSettings().getDeploymentId(),
+                embeddingSize,
+                customElandEmbeddingModel.getServiceSettings().similarity(),
+                customElandEmbeddingModel.getServiceSettings().elementType()
+            );
 
-        return new CustomElandEmbeddingModel(
-            model.getInferenceEntityId(),
-            model.getTaskType(),
-            model.getConfigurations().getService(),
-            serviceSettings,
-            model.getConfigurations().getChunkingSettings()
-        );
+            return new CustomElandEmbeddingModel(
+                customElandEmbeddingModel.getInferenceEntityId(),
+                customElandEmbeddingModel.getTaskType(),
+                customElandEmbeddingModel.getConfigurations().getService(),
+                serviceSettings,
+                customElandEmbeddingModel.getConfigurations().getChunkingSettings()
+            );
+        } else if (model instanceof ElasticsearchInternalModel) {
+            return model;
+        } else {
+            throw ServiceUtils.invalidModelTypeForUpdateModelWithEmbeddingDetails(model.getClass());
+        }
+
     }
 
     @Override
@@ -596,19 +600,22 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
     public void infer(
         Model model,
         @Nullable String query,
+        @Nullable Boolean returnDocuments,
+        @Nullable Integer topN,
         List<String> input,
         boolean stream,
         Map<String, Object> taskSettings,
         InputType inputType,
-        TimeValue timeout,
+        @Nullable TimeValue timeout,
         ActionListener<InferenceServiceResults> listener
     ) {
+        timeout = ServiceUtils.resolveInferenceTimeout(timeout, inputType, getClusterService());
         if (model instanceof ElasticsearchInternalModel esModel) {
             var taskType = model.getConfigurations().getTaskType();
             if (TaskType.TEXT_EMBEDDING.equals(taskType)) {
                 inferTextEmbedding(esModel, input, inputType, timeout, listener);
             } else if (TaskType.RERANK.equals(taskType)) {
-                inferRerank(esModel, query, input, inputType, timeout, taskSettings, listener);
+                inferRerank(esModel, query, input, returnDocuments, topN, inputType, timeout, taskSettings, listener);
             } else if (TaskType.SPARSE_EMBEDDING.equals(taskType)) {
                 inferSparseEmbedding(esModel, input, inputType, timeout, listener);
             } else {
@@ -669,22 +676,48 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         ElasticsearchInternalModel model,
         String query,
         List<String> inputs,
+        @Nullable Boolean returnDocuments,
+        @Nullable Integer topN,
         InputType inputType,
         TimeValue timeout,
         Map<String, Object> requestTaskSettings,
         ActionListener<InferenceServiceResults> listener
     ) {
-        var request = buildInferenceRequest(model.mlNodeDeploymentId(), new TextSimilarityConfigUpdate(query), inputs, inputType, timeout);
+        ActionListener<InferenceServiceResults> resultsListener = listener.delegateFailure((l, results) -> {
+            if (results instanceof RankedDocsResults rankedDocsResults) {
+                if (topN != null) {
+                    l.onResponse(new RankedDocsResults(rankedDocsResults.getRankedDocs().subList(0, topN)));
+                } else {
+                    l.onResponse(rankedDocsResults);
+                }
+            } else {
+                l.onFailure(new IllegalArgumentException("Expected RankedDocsResults but got: " + results.getClass().getName()));
+            }
+        });
 
         var returnDocs = Boolean.TRUE;
-        if (model.getTaskSettings() instanceof RerankTaskSettings modelSettings) {
+        if (returnDocuments != null) {
+            returnDocs = returnDocuments;
+        } else if (model.getTaskSettings() instanceof RerankTaskSettings modelSettings) {
             var requestSettings = RerankTaskSettings.fromMap(requestTaskSettings);
             returnDocs = RerankTaskSettings.of(modelSettings, requestSettings).returnDocuments();
         }
 
+        if (model instanceof ElasticRerankerModel elasticRerankerModel) {
+            var serviceSettings = elasticRerankerModel.getServiceSettings();
+            var longDocumentStrategy = serviceSettings.getLongDocumentStrategy();
+            if (longDocumentStrategy == ElasticRerankerServiceSettings.LongDocumentStrategy.CHUNK) {
+                var rerankChunker = new RerankRequestChunker(query, inputs, serviceSettings.getMaxChunksPerDoc());
+                inputs = rerankChunker.getChunkedInputs();
+                resultsListener = rerankChunker.parseChunkedRerankResultsListener(resultsListener, returnDocs);
+            }
+
+        }
+        var request = buildInferenceRequest(model.mlNodeDeploymentId(), new TextSimilarityConfigUpdate(query), inputs, inputType, timeout);
+
         Function<Integer, String> inputSupplier = returnDocs == Boolean.TRUE ? inputs::get : i -> null;
 
-        ActionListener<InferModelAction.Response> mlResultsListener = listener.delegateFailureAndWrap(
+        ActionListener<InferModelAction.Response> mlResultsListener = resultsListener.delegateFailureAndWrap(
             (l, inferenceResult) -> l.onResponse(textSimilarityResultsToRankedDocs(inferenceResult.getInferenceResults(), inputSupplier))
         );
 
@@ -695,22 +728,11 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         client.execute(InferModelAction.INSTANCE, request, maybeDeployListener);
     }
 
-    public void chunkedInfer(
-        Model model,
-        List<String> input,
-        Map<String, Object> taskSettings,
-        InputType inputType,
-        TimeValue timeout,
-        ActionListener<List<ChunkedInference>> listener
-    ) {
-        chunkedInfer(model, null, input, taskSettings, inputType, timeout, listener);
-    }
-
     @Override
     public void chunkedInfer(
         Model model,
         @Nullable String query,
-        List<String> input,
+        List<ChunkInferenceInput> input,
         Map<String, Object> taskSettings,
         InputType inputType,
         TimeValue timeout,
@@ -798,6 +820,11 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         return NAME;
     }
 
+    @Override
+    public List<String> aliases() {
+        return List.of(OLD_ELSER_SERVICE_NAME);
+    }
+
     private RankedDocsResults textSimilarityResultsToRankedDocs(
         List<? extends InferenceResults> results,
         Function<Integer, String> inputSupplier
@@ -834,7 +861,7 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         return List.of(
             new DefaultConfigId(DEFAULT_ELSER_ID, ElserInternalServiceSettings.minimalServiceSettings(), this),
             new DefaultConfigId(DEFAULT_E5_ID, MultilingualE5SmallInternalServiceSettings.minimalServiceSettings(), this),
-            new DefaultConfigId(DEFAULT_RERANK_ID, MinimalServiceSettings.rerank(), this)
+            new DefaultConfigId(DEFAULT_RERANK_ID, MinimalServiceSettings.rerank(NAME), this)
         );
     }
 
@@ -879,7 +906,7 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
             ActionListener.wrap(stats -> {
                 for (var deploymentStats : stats.getStats().results()) {
                     var modelsForDeploymentId = modelsByDeploymentIds.get(deploymentStats.getDeploymentId());
-                    modelsForDeploymentId.forEach(model -> model.updateNumAllocations(deploymentStats.getNumberOfAllocations()));
+                    modelsForDeploymentId.forEach(model -> model.updateServiceSettings(deploymentStats));
                 }
                 var updatedModels = new ArrayList<Model>();
                 modelsByDeploymentIds.values().forEach(updatedModels::addAll);
@@ -1048,6 +1075,14 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         }
     }
 
+    @Override
+    public int rerankerWindowSize(String modelId) {
+        // The Elastic reranker has a window size of 512 tokens.
+        // Return 300 words as a default that comfortably fits in the window.
+        // TODO custom rerank models may have larger windows, make this configurable
+        return RerankingInferenceService.CONSERVATIVE_DEFAULT_WINDOW_SIZE;
+    }
+
     /**
      * Iterates over the batch executing a limited number requests at a time to avoid
      * filling the ML node inference queue.
@@ -1104,7 +1139,7 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
             var inferenceRequest = buildInferenceRequest(
                 esModel.mlNodeDeploymentId(),
                 EmptyConfigUpdate.INSTANCE,
-                batch.batch().inputs(),
+                batch.batch().inputs().get(),
                 inputType,
                 timeout
             );

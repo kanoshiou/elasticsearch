@@ -43,14 +43,22 @@ import org.apache.lucene.util.CharsRefBuilder;
 import org.elasticsearch.action.OriginalIndices;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchShardTask;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.text.Text;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.CheckedConsumer;
+import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.index.cache.bitset.BitsetFilterCache;
+import org.elasticsearch.index.fielddata.IndexFieldDataCache;
+import org.elasticsearch.index.mapper.MapperMetrics;
+import org.elasticsearch.index.mapper.MappingLookup;
 import org.elasticsearch.index.query.MatchAllQueryBuilder;
 import org.elasticsearch.index.query.ParsedQuery;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.index.shard.IndexShard;
 import org.elasticsearch.index.shard.IndexShardTestCase;
+import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.search.internal.ContextIndexSearcher;
@@ -61,6 +69,7 @@ import org.elasticsearch.search.suggest.SuggestBuilder;
 import org.elasticsearch.search.suggest.Suggester;
 import org.elasticsearch.search.suggest.SuggestionSearchContext;
 import org.elasticsearch.test.TestSearchContext;
+import org.elasticsearch.xcontent.Text;
 import org.hamcrest.Matchers;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -80,9 +89,9 @@ public class QueryPhaseTimeoutTests extends IndexShardTestCase {
         dir = newDirectory();
         IndexWriterConfig iwc = new IndexWriterConfig();
         RandomIndexWriter w = new RandomIndexWriter(random(), dir, iwc);
-        // the upper bound is higher than 2048 so that in some cases we time out after the first batch of bulk scoring, but before
+        // the upper bound is higher than 4096 so that in some cases we time out after the first batch of bulk scoring, but before
         // getting to the end of the first segment
-        numDocs = scaledRandomIntBetween(500, 2500);
+        numDocs = scaledRandomIntBetween(500, 4500);
         for (int i = 0; i < numDocs; ++i) {
             Document doc = new Document();
             doc.add(new StringField("field", Integer.toString(i), Field.Store.NO));
@@ -309,9 +318,9 @@ public class QueryPhaseTimeoutTests extends IndexShardTestCase {
                 QueryPhase.executeQuery(context);
                 assertTrue(context.queryResult().searchTimedOut());
                 int firstSegmentMaxDoc = reader.leaves().get(0).reader().maxDoc();
-                // See CancellableBulkScorer#INITIAL_INTERVAL for the source of 2048: we always score the first
-                // batch of up to 2048 docs, and only then raise the timeout
-                assertEquals(Math.min(2048, firstSegmentMaxDoc), context.queryResult().topDocs().topDocs.totalHits.value());
+                // See CancellableBulkScorer#INITIAL_INTERVAL for the source of 4096: we always score the first
+                // batch of up to 4096 docs, and only then raise the timeout
+                assertEquals(Math.min(4096, firstSegmentMaxDoc), context.queryResult().topDocs().topDocs.totalHits.value());
                 assertEquals(Math.min(size, firstSegmentMaxDoc), context.queryResult().topDocs().topDocs.scoreDocs.length);
             }
         }
@@ -375,7 +384,7 @@ public class QueryPhaseTimeoutTests extends IndexShardTestCase {
     }
 
     private TestSearchContext createSearchContextWithTimeout(TimeoutQuery query, int size) throws IOException {
-        TestSearchContext context = new TestSearchContext(null, indexShard, newContextSearcher(reader)) {
+        TestSearchContext context = new TestSearchContext(createSearchExecutionContext(), indexShard, newContextSearcher(reader)) {
             @Override
             public long getRelativeTimeInMillis() {
                 // this controls whether a timeout is raised or not. We abstract time away by pretending that the clock stops
@@ -391,11 +400,45 @@ public class QueryPhaseTimeoutTests extends IndexShardTestCase {
     }
 
     private TestSearchContext createSearchContext(Query query, int size) throws IOException {
-        TestSearchContext context = new TestSearchContext(null, indexShard, newContextSearcher(reader));
+        TestSearchContext context = new TestSearchContext(createSearchExecutionContext(), indexShard, newContextSearcher(reader));
         context.setTask(new SearchShardTask(123L, "", "", "", null, Collections.emptyMap()));
         context.parsedQuery(new ParsedQuery(query));
         context.setSize(size);
         return context;
+    }
+
+    private SearchExecutionContext createSearchExecutionContext() {
+        IndexMetadata indexMetadata = IndexMetadata.builder("index")
+            .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current()))
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .creationDate(System.currentTimeMillis())
+            .build();
+        IndexSettings indexSettings = new IndexSettings(indexMetadata, Settings.EMPTY);
+        // final SimilarityService similarityService = new SimilarityService(indexSettings, null, Map.of());
+        final long nowInMillis = randomNonNegativeLong();
+        return new SearchExecutionContext(
+            0,
+            0,
+            indexSettings,
+            new BitsetFilterCache(indexSettings, BitsetFilterCache.Listener.NOOP),
+            (ft, fdc) -> ft.fielddataBuilder(fdc).build(new IndexFieldDataCache.None(), new NoneCircuitBreakerService()),
+            null,
+            MappingLookup.EMPTY,
+            null,
+            null,
+            parserConfig(),
+            writableRegistry(),
+            null,
+            null,
+            () -> nowInMillis,
+            null,
+            null,
+            () -> true,
+            null,
+            Collections.emptyMap(),
+            MapperMetrics.NOOP
+        );
     }
 
     public void testSuggestOnlyWithTimeout() throws Exception {
@@ -428,7 +471,7 @@ public class QueryPhaseTimeoutTests extends IndexShardTestCase {
         ContextIndexSearcher contextIndexSearcher = newContextSearcher(reader);
         SuggestionSearchContext suggestionSearchContext = new SuggestionSearchContext();
         suggestionSearchContext.addSuggestion("suggestion", new TestSuggestionContext(new TestSuggester(contextIndexSearcher), null));
-        TestSearchContext context = new TestSearchContext(null, indexShard, contextIndexSearcher) {
+        TestSearchContext context = new TestSearchContext(createSearchExecutionContext(), indexShard, contextIndexSearcher) {
             @Override
             public SuggestionSearchContext suggest() {
                 return suggestionSearchContext;

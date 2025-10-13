@@ -9,6 +9,7 @@
 
 package org.elasticsearch.cluster.metadata;
 
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.admin.indices.rollover.MaxAgeCondition;
 import org.elasticsearch.action.admin.indices.rollover.MaxDocsCondition;
 import org.elasticsearch.action.admin.indices.rollover.MaxPrimaryShardDocsCondition;
@@ -64,6 +65,8 @@ import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 
 public class IndexMetadataTests extends ESTestCase {
+
+    private static final TransportVersion ESQL_FAILURE_FROM_REMOTE = TransportVersion.fromName("esql_failure_from_remote");
 
     @Before
     public void setUp() throws Exception {
@@ -166,6 +169,7 @@ public class IndexMetadataTests extends ESTestCase {
         assertEquals(metadata.getForecastedWriteLoad(), fromXContentMeta.getForecastedWriteLoad());
         assertEquals(metadata.getForecastedShardSizeInBytes(), fromXContentMeta.getForecastedShardSizeInBytes());
         assertEquals(metadata.getInferenceFields(), fromXContentMeta.getInferenceFields());
+        assertEquals(metadata.getReshardingMetadata(), fromXContentMeta.getReshardingMetadata());
 
         final BytesStreamOutput out = new BytesStreamOutput();
         metadata.writeTo(out);
@@ -192,6 +196,7 @@ public class IndexMetadataTests extends ESTestCase {
             assertEquals(metadata.getForecastedShardSizeInBytes(), deserialized.getForecastedShardSizeInBytes());
             assertEquals(metadata.getInferenceFields(), deserialized.getInferenceFields());
             assertEquals(metadata.getEventIngestedRange(), deserialized.getEventIngestedRange());
+            assertEquals(metadata.getReshardingMetadata(), deserialized.getReshardingMetadata());
         }
     }
 
@@ -676,6 +681,34 @@ public class IndexMetadataTests extends ESTestCase {
         assertThat(idxMeta2.getInferenceFields(), equalTo(dynamicFields));
     }
 
+    public void testReshardingBWCSerialization() throws IOException {
+        final int numShards = randomIntBetween(1, 8);
+        final var settings = indexSettings(IndexVersion.current(), numShards, 0);
+        final var reshardingMetadata = IndexReshardingMetadata.newSplitByMultiple(numShards, randomIntBetween(2, 5));
+        IndexMetadata idx = IndexMetadata.builder("test").settings(settings).reshardingMetadata(reshardingMetadata).build();
+
+        // the version prior to TransportVersions.INDEX_RESHARDING_METADATA
+        final var version = ESQL_FAILURE_FROM_REMOTE;
+        // should round trip
+        final var deserialized = roundTripWithVersion(idx, version);
+
+        // but be missing resharding metadata
+        assertNull(deserialized.getReshardingMetadata());
+        // but otherwise be equal
+        assertEquals(idx, IndexMetadata.builder(deserialized).reshardingMetadata(reshardingMetadata).build());
+    }
+
+    private IndexMetadata roundTripWithVersion(IndexMetadata indexMetadata, TransportVersion version) throws IOException {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.setTransportVersion(version);
+            indexMetadata.writeTo(out);
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), writableRegistry())) {
+                in.setTransportVersion(version);
+                return IndexMetadata.readFrom(in);
+            }
+        }
+    }
+
     private static Settings indexSettingsWithDataTier(String dataTier) {
         return indexSettings(IndexVersion.current(), 1, 0).put(DataTier.TIER_PREFERENCE, dataTier).build();
     }
@@ -695,7 +728,8 @@ public class IndexMetadataTests extends ESTestCase {
             name,
             randomIdentifier(),
             randomIdentifier(),
-            randomSet(1, 5, ESTestCase::randomIdentifier).toArray(String[]::new)
+            randomSet(1, 5, ESTestCase::randomIdentifier).toArray(String[]::new),
+            InferenceFieldMetadataTests.generateRandomChunkingSettings()
         );
     }
 
@@ -703,7 +737,13 @@ public class IndexMetadataTests extends ESTestCase {
         IndexWriteLoad.Builder indexWriteLoadBuilder = IndexWriteLoad.builder(numberOfShards);
         int numberOfPopulatedWriteLoads = randomIntBetween(0, numberOfShards);
         for (int i = 0; i < numberOfPopulatedWriteLoads; i++) {
-            indexWriteLoadBuilder.withShardWriteLoad(i, randomDoubleBetween(0.0, 128.0, true), randomNonNegativeLong());
+            indexWriteLoadBuilder.withShardWriteLoad(
+                i,
+                randomDoubleBetween(0.0, 128.0, true),
+                randomDoubleBetween(0.0, 128.0, true),
+                randomDoubleBetween(0.0, 128.0, true),
+                randomNonNegativeLong()
+            );
         }
         return new IndexMetadataStats(indexWriteLoadBuilder.build(), randomLongBetween(100, 1024), randomIntBetween(1, 2));
     }

@@ -10,10 +10,11 @@
 package org.elasticsearch.simdvec.internal;
 
 import org.apache.lucene.store.MemorySegmentAccessInput;
-import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
+import org.apache.lucene.util.hnsw.UpdateableRandomVectorScorer;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.apache.lucene.util.quantization.ScalarQuantizedVectorSimilarity;
+import org.elasticsearch.simdvec.QuantizedByteVectorValuesAccess;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -23,7 +24,7 @@ import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
 import static org.apache.lucene.index.VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT;
 import static org.apache.lucene.util.quantization.ScalarQuantizedVectorSimilarity.fromVectorSimilarity;
 
-public abstract sealed class Int7SQVectorScorerSupplier implements RandomVectorScorerSupplier {
+public abstract sealed class Int7SQVectorScorerSupplier implements RandomVectorScorerSupplier, QuantizedByteVectorValuesAccess {
 
     static final byte BITS = 7;
 
@@ -55,9 +56,6 @@ public abstract sealed class Int7SQVectorScorerSupplier implements RandomVectorS
     }
 
     final float scoreFromOrds(int firstOrd, int secondOrd) throws IOException {
-        checkOrdinal(firstOrd);
-        checkOrdinal(secondOrd);
-
         final int length = dims;
         long firstByteOffset = (long) firstOrd * (length + Float.BYTES);
         long secondByteOffset = (long) secondOrd * (length + Float.BYTES);
@@ -92,14 +90,27 @@ public abstract sealed class Int7SQVectorScorerSupplier implements RandomVectorS
     }
 
     @Override
-    public RandomVectorScorer scorer(int ord) {
-        checkOrdinal(ord);
-        return new RandomVectorScorer.AbstractRandomVectorScorer(values) {
+    public UpdateableRandomVectorScorer scorer() {
+        return new UpdateableRandomVectorScorer.AbstractUpdateableRandomVectorScorer(values) {
+            private int ord = -1;
+
             @Override
             public float score(int node) throws IOException {
+                checkOrdinal(node);
                 return scoreFromOrds(ord, node);
             }
+
+            @Override
+            public void setScoringOrdinal(int node) throws IOException {
+                checkOrdinal(node);
+                this.ord = node;
+            }
         };
+    }
+
+    @Override
+    public QuantizedByteVectorValues get() {
+        return values;
     }
 
     public static final class EuclideanSupplier extends Int7SQVectorScorerSupplier {

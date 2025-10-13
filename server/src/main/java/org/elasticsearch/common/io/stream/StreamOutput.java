@@ -18,14 +18,15 @@ import org.elasticsearch.TransportVersions;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.compress.CompressorFactory;
 import org.elasticsearch.common.geo.GeoPoint;
 import org.elasticsearch.common.io.stream.Writeable.Writer;
 import org.elasticsearch.common.settings.SecureString;
-import org.elasticsearch.common.text.Text;
 import org.elasticsearch.common.util.ByteUtils;
 import org.elasticsearch.core.CharArrays;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.xcontent.Text;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
@@ -50,7 +51,6 @@ import java.util.Set;
 import java.util.function.IntFunction;
 
 import static java.util.Map.entry;
-import static org.elasticsearch.TransportVersions.V_8_11_X;
 
 /**
  * A stream from another node to this node. Technically, it can also be streamed from a byte array but that is mostly for testing.
@@ -132,12 +132,32 @@ public abstract class StreamOutput extends OutputStream {
      * Serializes a writable just like {@link Writeable#writeTo(StreamOutput)} would but prefixes it with the serialized size of the result.
      *
      * @param writeable {@link Writeable} to serialize
+     * @deprecated use {@link #writeWithSizePrefix} instead
      */
-    public void writeWithSizePrefix(Writeable writeable) throws IOException {
+    @Deprecated
+    public void legacyWriteWithSizePrefix(Writeable writeable) throws IOException {
         final BytesStreamOutput tmp = new BytesStreamOutput();
         tmp.setTransportVersion(version);
         writeable.writeTo(tmp);
         writeBytesReference(tmp.bytes());
+    }
+
+    /**
+     * Serializes a writable just like {@link Writeable#writeTo(StreamOutput)} would but also compresses and prefixes it with the serialized
+     * size of the result.
+
+     *
+     * @param writeable {@link Writeable} to serialize
+     */
+    public void writeWithSizePrefix(Writeable writeable) throws IOException {
+        final BytesStreamOutput tmp = new BytesStreamOutput();
+        try (var o = new OutputStreamStreamOutput(CompressorFactory.COMPRESSOR.threadLocalOutputStream(tmp))) {
+            o.setTransportVersion(version);
+            writeable.writeTo(o);
+        }
+        var bytes = tmp.bytes();
+        this.writeInt(bytes.length());
+        bytes.writeTo(this);
     }
 
     /**
@@ -234,7 +254,7 @@ public abstract class StreamOutput extends OutputStream {
         return putMultiByteVInt(buffer, i, off);
     }
 
-    private static int putMultiByteVInt(byte[] buffer, int i, int off) {
+    protected static int putMultiByteVInt(byte[] buffer, int i, int off) {
         int index = off;
         do {
             buffer[index++] = ((byte) ((i & 0x7f) | 0x80));
@@ -399,7 +419,8 @@ public abstract class StreamOutput extends OutputStream {
             writeInt(spare.length());
             write(spare.bytes(), 0, spare.length());
         } else {
-            BytesReference bytes = text.bytes();
+            var encoded = text.bytes();
+            BytesReference bytes = new BytesArray(encoded.bytes(), encoded.offset(), encoded.length());
             writeInt(bytes.length());
             bytes.writeTo(this);
         }
@@ -592,11 +613,7 @@ public abstract class StreamOutput extends OutputStream {
         Iterator<? extends Map.Entry<String, ?>> iterator = map.entrySet().stream().sorted(Map.Entry.comparingByKey()).iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, ?> next = iterator.next();
-            if (this.getTransportVersion().onOrAfter(TransportVersions.V_8_7_0)) {
-                this.writeGenericValue(next.getKey());
-            } else {
-                this.writeString(next.getKey());
-            }
+            this.writeGenericValue(next.getKey());
             this.writeGenericValue(next.getValue());
         }
     }
@@ -620,6 +637,26 @@ public abstract class StreamOutput extends OutputStream {
      */
     public final <K extends Writeable, V extends Writeable> void writeMap(final Map<K, V> map) throws IOException {
         writeMap(map, StreamOutput::writeWriteable, StreamOutput::writeWriteable);
+    }
+
+    /**
+     * Write an optional {@link Map} of {@code K}-type keys to {@code V}-type.
+     * <pre><code>
+     * Map&lt;String, String&gt; map = ...;
+     * out.writeMap(map, StreamOutput::writeString, StreamOutput::writeString);
+     * </code></pre>
+     *
+     * @param keyWriter The key writer
+     * @param valueWriter The value writer
+     */
+    public final <K, V> void writeOptionalMap(final Map<K, V> map, final Writer<K> keyWriter, final Writer<V> valueWriter)
+        throws IOException {
+        if (map == null) {
+            writeBoolean(false);
+        } else {
+            writeBoolean(true);
+            writeMap(map, keyWriter, valueWriter);
+        }
     }
 
     /**
@@ -710,14 +747,8 @@ public abstract class StreamOutput extends OutputStream {
             } else {
                 o.writeByte((byte) 10);
             }
-            if (o.getTransportVersion().onOrAfter(TransportVersions.V_8_7_0)) {
-                final Map<?, ?> map = (Map<?, ?>) v;
-                o.writeMap(map, StreamOutput::writeGenericValue, StreamOutput::writeGenericValue);
-            } else {
-                @SuppressWarnings("unchecked")
-                final Map<String, ?> map = (Map<String, ?>) v;
-                o.writeMap(map, StreamOutput::writeGenericValue);
-            }
+            final Map<?, ?> map = (Map<?, ?>) v;
+            o.writeMap(map, StreamOutput::writeGenericValue, StreamOutput::writeGenericValue);
         }),
         entry(Byte.class, (o, v) -> {
             o.writeByte((byte) 11);
@@ -813,13 +844,10 @@ public abstract class StreamOutput extends OutputStream {
         entry(GenericNamedWriteable.class, (o, v) -> {
             // Note that we do not rely on the checks in VersionCheckingStreamOutput because that only applies to CCS
             final var genericNamedWriteable = (GenericNamedWriteable) v;
-            TransportVersion minSupportedVersion = genericNamedWriteable.getMinimalSupportedVersion();
-            assert minSupportedVersion.onOrAfter(V_8_11_X) : "[GenericNamedWriteable] requires [" + V_8_11_X + "]";
-            if (o.getTransportVersion().before(minSupportedVersion)) {
+            if (genericNamedWriteable.supportsVersion(o.getTransportVersion()) == false) {
                 final var message = Strings.format(
-                    "[%s] requires minimal transport version [%s] and cannot be sent using transport version [%s]",
+                    "[%s] doesn't support serialization with transport version [%s]",
                     genericNamedWriteable.getWriteableName(),
-                    minSupportedVersion,
                     o.getTransportVersion()
                 );
                 assert false : message;

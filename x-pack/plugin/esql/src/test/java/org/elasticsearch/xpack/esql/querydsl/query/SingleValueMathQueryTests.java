@@ -13,6 +13,8 @@ import org.apache.lucene.document.DoubleField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KeywordField;
 import org.apache.lucene.document.LongField;
+import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.search.IndexSearcher;
@@ -20,6 +22,8 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.NumericUtils;
 import org.elasticsearch.compute.operator.DriverContext;
 import org.elasticsearch.compute.operator.Warnings;
 import org.elasticsearch.compute.querydsl.query.SingleValueMatchQuery;
@@ -48,13 +52,16 @@ public class SingleValueMathQueryTests extends MapperServiceTestCase {
         void assertRewrite(IndexSearcher indexSearcher, Query query) throws IOException;
     }
 
-    @ParametersFactory
+    @ParametersFactory(argumentFormatting = "%s")
     public static List<Object[]> params() {
         List<Object[]> params = new ArrayList<>();
         for (String fieldType : new String[] { "long", "integer", "short", "byte", "double", "float", "keyword" }) {
+            params.add(new Object[] { new SneakyTwo(fieldType) });
             for (boolean multivaluedField : new boolean[] { true, false }) {
                 for (boolean allowEmpty : new boolean[] { true, false }) {
-                    params.add(new Object[] { new StandardSetup(fieldType, multivaluedField, allowEmpty, 100) });
+                    for (boolean docValuesOnly : new boolean[] { true, false }) {
+                        params.add(new Object[] { new StandardSetup(fieldType, multivaluedField, docValuesOnly, allowEmpty, 100) });
+                    }
                 }
             }
         }
@@ -121,21 +128,27 @@ public class SingleValueMathQueryTests extends MapperServiceTestCase {
         }
     }
 
-    private record StandardSetup(String fieldType, boolean multivaluedField, boolean empty, int count) implements Setup {
+    private record StandardSetup(String fieldType, boolean multivaluedField, boolean docValuesOnly, boolean empty, int count)
+        implements
+            Setup {
         @Override
         public XContentBuilder mapping(XContentBuilder builder) throws IOException {
-            return builder.startObject("foo").field("type", fieldType).endObject();
+            if (docValuesOnly) {
+                return builder.startObject("foo").field("type", fieldType).field("index", false).endObject();
+            } else {
+                return builder.startObject("foo").field("type", fieldType).endObject();
+            }
         }
 
         @Override
         public List<List<Object>> build(RandomIndexWriter iw) throws IOException {
-            List<List<Object>> fieldValues = new ArrayList<>(100);
+            List<List<Object>> docs = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 List<Object> values = values(i);
-                fieldValues.add(values);
-                iw.addDocument(docFor(values));
+                docs.add(values);
+                iw.addDocument(docFor(values, docValuesOnly));
             }
-            return fieldValues;
+            return docs;
         }
 
         @Override
@@ -154,7 +167,7 @@ public class SingleValueMathQueryTests extends MapperServiceTestCase {
                 int count = between(2, 10);
                 Set<Object> set = new HashSet<>(count);
                 while (set.size() < count) {
-                    set.add(randomValue());
+                    set.add(randomValue(fieldType));
                 }
                 return List.copyOf(set);
             }
@@ -162,45 +175,76 @@ public class SingleValueMathQueryTests extends MapperServiceTestCase {
             if (empty && (i == 0 || randomBoolean())) {
                 return List.of();
             }
-            return List.of(randomValue());
+            return List.of(randomValue(fieldType));
+        }
+    }
+
+    /**
+     * Tests a scenario where we were incorrectly rewriting {@code keyword} fields to
+     * {@link MatchAllDocsQuery} when:
+     * <ul>
+     *     <li>Is defined on every field</li>
+     *     <li>Contains the same number of distinct values as documents</li>
+     * </ul>
+     */
+    private record SneakyTwo(String fieldType) implements Setup {
+        @Override
+        public XContentBuilder mapping(XContentBuilder builder) throws IOException {
+            return builder.startObject("foo").field("type", fieldType).endObject();
         }
 
-        private Object randomValue() {
-            return switch (fieldType) {
-                case "long" -> randomLong();
-                case "integer" -> randomInt();
-                case "short" -> randomShort();
-                case "byte" -> randomByte();
-                case "double" -> randomDouble();
-                case "float" -> randomFloat();
-                case "keyword" -> randomAlphaOfLength(5);
-                default -> throw new UnsupportedOperationException();
-            };
+        @Override
+        public List<List<Object>> build(RandomIndexWriter iw) throws IOException {
+            Object first = randomValue(fieldType);
+            Object second = randomValue(fieldType);
+            List<Object> justFirst = List.of(first);
+            List<Object> both = List.of(first, second);
+            iw.addDocument(docFor(justFirst, false));
+            iw.addDocument(docFor(both, false));
+            return List.of(justFirst, both);
         }
 
-        private List<IndexableField> docFor(Iterable<Object> values) {
-            List<IndexableField> fields = new ArrayList<>();
-            switch (fieldType) {
-                case "long", "integer", "short", "byte" -> {
-                    for (Object v : values) {
-                        long l = ((Number) v).longValue();
-                        fields.add(new LongField("foo", l, Field.Store.NO));
-                    }
-                }
-                case "double", "float" -> {
-                    for (Object v : values) {
-                        double d = ((Number) v).doubleValue();
-                        fields.add(new DoubleField("foo", d, Field.Store.NO));
-                    }
-                }
-                case "keyword" -> {
-                    for (Object v : values) {
-                        fields.add(new KeywordField("foo", v.toString(), Field.Store.NO));
-                    }
-                }
-                default -> throw new UnsupportedOperationException();
+        @Override
+        public void assertRewrite(IndexSearcher indexSearcher, Query query) throws IOException {
+            // There are multivalued fields
+            assertThat(query.rewrite(indexSearcher), sameInstance(query));
+        }
+    }
+
+    private static Object randomValue(String fieldType) {
+        return switch (fieldType) {
+            case "long" -> randomLong();
+            case "integer" -> randomInt();
+            case "short" -> randomShort();
+            case "byte" -> randomByte();
+            case "double" -> randomDouble();
+            case "float" -> randomFloat();
+            case "keyword" -> randomAlphaOfLength(5);
+            default -> throw new UnsupportedOperationException();
+        };
+    }
+
+    private static List<IndexableField> docFor(Iterable<Object> values, boolean docValuesOnly) {
+        List<IndexableField> fields = new ArrayList<>();
+        for (Object v : values) {
+            if (docValuesOnly) {
+                fields.add(switch (v) {
+                    case Double n -> new SortedNumericDocValuesField("foo", NumericUtils.doubleToSortableLong(n));
+                    case Float n -> new SortedNumericDocValuesField("foo", NumericUtils.doubleToSortableLong(n));
+                    case Number n -> new SortedNumericDocValuesField("foo", n.longValue());
+                    case String s -> new SortedSetDocValuesField("foo", new BytesRef(s));
+                    default -> throw new UnsupportedOperationException();
+                });
+            } else {
+                fields.add(switch (v) {
+                    case Double n -> new DoubleField("foo", n, Field.Store.NO);
+                    case Float n -> new DoubleField("foo", n, Field.Store.NO);
+                    case Number n -> new LongField("foo", n.longValue(), Field.Store.NO);
+                    case String s -> new KeywordField("foo", s, Field.Store.NO);
+                    default -> throw new UnsupportedOperationException();
+                });
             }
-            return fields;
         }
+        return fields;
     }
 }

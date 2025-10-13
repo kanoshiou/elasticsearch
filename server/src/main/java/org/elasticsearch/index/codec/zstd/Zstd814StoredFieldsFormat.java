@@ -48,7 +48,7 @@ public final class Zstd814StoredFieldsFormat extends Lucene90CompressingStoredFi
     public static final String MODE_KEY = Zstd814StoredFieldsFormat.class.getSimpleName() + ".mode";
 
     public enum Mode {
-        BEST_SPEED(0, BEST_SPEED_BLOCK_SIZE, 128),
+        BEST_SPEED(1, BEST_SPEED_BLOCK_SIZE, 128),
         BEST_COMPRESSION(3, BEST_COMPRESSION_BLOCK_SIZE, 2048);
 
         final int level, blockSizeInBytes, blockDocCount;
@@ -134,8 +134,8 @@ public final class Zstd814StoredFieldsFormat extends Lucene90CompressingStoredFi
             final int compressedLength = in.readVInt();
 
             try (
-                CloseableByteBuffer src = nativeAccess.newBuffer(compressedLength);
-                CloseableByteBuffer dest = nativeAccess.newBuffer(originalLength)
+                CloseableByteBuffer src = nativeAccess.newConfinedBuffer(compressedLength);
+                CloseableByteBuffer dest = nativeAccess.newConfinedBuffer(originalLength)
             ) {
 
                 while (src.buffer().position() < compressedLength) {
@@ -193,8 +193,8 @@ public final class Zstd814StoredFieldsFormat extends Lucene90CompressingStoredFi
             // identify duplicate strings. So if we wanted to avoid allocating memory on every compress call, we should also look into
             // reusing compression contexts, which are not small and would increase permanent memory usage as well.
             try (
-                CloseableByteBuffer src = nativeAccess.newBuffer(srcLen);
-                CloseableByteBuffer dest = nativeAccess.newBuffer(compressBound)
+                CloseableByteBuffer src = nativeAccess.newConfinedBuffer(srcLen);
+                CloseableByteBuffer dest = nativeAccess.newConfinedBuffer(compressBound)
             ) {
 
                 while (buffersInput.position() < buffersInput.length()) {
