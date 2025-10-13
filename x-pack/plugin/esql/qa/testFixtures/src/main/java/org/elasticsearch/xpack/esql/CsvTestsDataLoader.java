@@ -10,7 +10,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import org.apache.http.HttpEntity;
 import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -25,19 +24,20 @@ import org.elasticsearch.client.RestClientBuilder;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.logging.LogConfigurator;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.inference.TaskType;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.test.rest.ESRestTestCase;
-import org.elasticsearch.xcontent.XContentType;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -55,6 +55,8 @@ import static org.elasticsearch.xpack.esql.CsvTestUtils.multiValuesAwareCsvToStr
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.reader;
 
 public class CsvTestsDataLoader {
+    private static final String BRUNO_PATH = "/Users/deko/Documents/bruno/elastic/sample data";
+
     private static final int BULK_DATA_SIZE = 100_000;
     private static final TestDataset EMPLOYEES = new TestDataset("employees", "mapping-default.json", "employees.csv").noSubfields();
     private static final TestDataset EMPLOYEES_INCOMPATIBLE = new TestDataset(
@@ -334,10 +336,12 @@ public class CsvTestsDataLoader {
                 jsonBody.append("\"mappings\":");
                 jsonBody.append(indexMapping);
                 jsonBody.append("}");
+                // 生成add index.bru文件
+                generateAddIndexBruFile(indexName, jsonBody.toString());
 
                 Request request = new Request("PUT", "/" + indexName);
                 request.setJsonEntity(jsonBody.toString());
-                restClient.performRequest(request);
+                // restClient.performRequest(request);
             });
         }
     }
@@ -427,7 +431,7 @@ public class CsvTestsDataLoader {
             load(client, dataset, logger, indexCreator);
             loadedDatasets.add(dataset.indexName);
         }
-        forceMerge(client, loadedDatasets, logger);
+        // forceMerge(client, loadedDatasets, logger);
         for (var policy : ENRICH_POLICIES) {
             loadEnrichPolicy(client, policy.policyName, policy.policyFileName, logger);
         }
@@ -573,10 +577,13 @@ public class CsvTestsDataLoader {
         String entity = readTextFile(policyMapping);
         Request request = new Request("PUT", "/_enrich/policy/" + policyName);
         request.setJsonEntity(entity);
-        client.performRequest(request);
+        // 生成add policy.bru文件
+        generateEnrichPolicyBruFiles(policyName, entity);
+
+        // client.performRequest(request);
 
         request = new Request("POST", "/_enrich/policy/" + policyName + "/_execute");
-        client.performRequest(request);
+        // client.performRequest(request);
     }
 
     private static URL getResource(String name) {
@@ -795,26 +802,29 @@ public class CsvTestsDataLoader {
         throws IOException {
         // The indexName is optional for a bulk request, but we use it for routing in MultiClusterSpecIT.
         builder.append("\n");
+        // 生成import data.bru文件
+        generateImportDataBruFile(indexName, builder.toString());
+
         logger.debug("Sending bulk request of [{}] bytes for [{}]", builder.length(), indexName);
         Request request = new Request("POST", "/" + indexName + "/_bulk");
         request.setJsonEntity(builder.toString());
         request.addParameter("refresh", "false"); // will be _forcemerge'd next
-        Response response = client.performRequest(request);
-        if (response.getStatusLine().getStatusCode() == 200) {
-            HttpEntity entity = response.getEntity();
-            try (InputStream content = entity.getContent()) {
-                XContentType xContentType = XContentType.fromMediaType(entity.getContentType().getValue());
-                Map<String, Object> result = XContentHelper.convertToMap(xContentType.xContent(), content, false);
-                Object errors = result.get("errors");
-                if (Boolean.FALSE.equals(errors)) {
-                    logger.info("Data loading of [{}] bytes into [{}] OK", builder.length(), indexName);
-                } else {
-                    addError(failures, indexName, builder, "errors: " + result);
-                }
-            }
-        } else {
-            addError(failures, indexName, builder, "status: " + response.getStatusLine());
-        }
+        // Response response = client.performRequest(request);
+        // if (response.getStatusLine().getStatusCode() == 200) {
+        // HttpEntity entity = response.getEntity();
+        // try (InputStream content = entity.getContent()) {
+        // XContentType xContentType = XContentType.fromMediaType(entity.getContentType().getValue());
+        // Map<String, Object> result = XContentHelper.convertToMap(xContentType.xContent(), content, false);
+        // Object errors = result.get("errors");
+        // if (Boolean.FALSE.equals(errors)) {
+        // logger.info("Data loading of [{}] bytes into [{}] OK", builder.length(), indexName);
+        // } else {
+        // addError(failures, indexName, builder, "errors: " + result);
+        // }
+        // }
+        // } else {
+        // addError(failures, indexName, builder, "status: " + response.getStatusLine());
+        // }
     }
 
     private static void addError(List<String> failures, String indexName, StringBuilder builder, String message) {
@@ -958,5 +968,184 @@ public class CsvTestsDataLoader {
 
     private interface IndexCreator {
         void createIndex(RestClient client, String indexName, String mapping, Settings indexSettings) throws IOException;
+    }
+
+    /**
+     * 生成add index.bru文件
+     */
+    private static void generateAddIndexBruFile(String indexName, String jsonBody) {
+        try {
+            Path datasetDir = Paths.get(BRUNO_PATH, "dataset", indexName);
+            Files.createDirectories(datasetDir);
+
+            String bruContent = String.format("""
+                meta {
+                  name: add index
+                  type: http
+                  seq: 1
+                }
+
+                put {
+                  url: {{baseUrl}}/:index
+                  body: json
+                  auth: none
+                }
+
+                params:path {
+                  index: %s
+                }
+
+                headers {
+                  Content-Type: application/json
+                }
+
+                body:json {
+                %s
+                }
+
+                """, indexName, formatJsonForBruno(jsonBody));
+
+            Path bruFile = datasetDir.resolve("add index.bru");
+            Files.write(bruFile, bruContent.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("Generated: " + bruFile.toString());
+        } catch (IOException e) {
+            System.err.println("Failed to generate add index.bru for " + indexName + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * 生成import data.bru文件
+     */
+    private static void generateImportDataBruFile(String indexName, String bulkData) {
+        try {
+            Path datasetDir = Paths.get(BRUNO_PATH, "dataset", indexName);
+            Files.createDirectories(datasetDir);
+
+            String bruContent = String.format("""
+                meta {
+                  name: import data
+                  type: http
+                  seq: 2
+                }
+
+                post {
+                  url: {{baseUrl}}/_bulk
+                  body: text
+                  auth: none
+                }
+
+                headers {
+                  Content-Type: application/json
+                }
+
+                body:text {
+                %s
+
+                }
+                """, addSpaceFront(bulkData));
+
+            Path bruFile = datasetDir.resolve("import data.bru");
+            Files.write(bruFile, bruContent.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("Generated: " + bruFile.toString());
+        } catch (IOException e) {
+            System.err.println("Failed to generate import data.bru for " + indexName + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * 生成enrich policy相关的bru文件
+     */
+    private static void generateEnrichPolicyBruFiles(String policyName, String policyEntity) {
+        try {
+            Path policyDir = Paths.get(BRUNO_PATH, "enrich policy", policyName);
+            Files.createDirectories(policyDir);
+
+            // 生成add policy.bru文件
+            String addPolicyContent = String.format("""
+                meta {
+                  name: add policy
+                  type: http
+                  seq: 1
+                }
+
+                put {
+                  url: {{baseUrl}}/_enrich/policy/:policyName
+                  body: json
+                  auth: inherit
+                }
+
+                params:path {
+                  policyName: %s
+                }
+
+                body:json {
+                %s
+                }
+
+                """, policyName, formatJsonForBruno(policyEntity));
+
+            Path addPolicyFile = policyDir.resolve("add policy.bru");
+            Files.write(addPolicyFile, addPolicyContent.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("Generated: " + addPolicyFile.toString());
+
+            // 生成_execute.bru文件
+            String executeContent = String.format("""
+                meta {
+                  name: _execute
+                  type: http
+                  seq: 2
+                }
+
+                post {
+                  url: {{baseUrl}}/_enrich/policy/:policyName/_execute
+                  body: none
+                  auth: inherit
+                }
+
+                params:path {
+                  policyName: %s
+                }
+
+                """, policyName);
+
+            Path executeFile = policyDir.resolve("_execute.bru");
+            Files.write(executeFile, executeContent.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("Generated: " + executeFile.toString());
+
+        } catch (IOException e) {
+            System.err.println("Failed to generate enrich policy bru files for " + policyName + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * 格式化JSON用于Bruno文件
+     */
+    private static String formatJsonForBruno(String jsonString) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            Object json = mapper.readValue(jsonString, Object.class);
+            String formattedJson = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(json);
+            // 去掉冒号后面的空格，将 " : " 替换为 ": "
+            formattedJson = formattedJson.replaceAll(" : ", ": ");
+            return addSpaceFront(formattedJson).toString();
+        } catch (Exception e) {
+            // 如果格式化失败，返回原始字符串，也要加上空格缩进
+            return addSpaceFront(jsonString).toString();
+        }
+    }
+
+    private static StringBuilder addSpaceFront(String formattedJson) {
+
+        // 在每一行前面加上两个空格
+        String[] lines = formattedJson.split("\n");
+        StringBuilder result = new StringBuilder();
+        for (String line : lines) {
+            result.append("  ").append(line).append("\n");
+        }
+        // 移除最后一个换行符
+        if (result.isEmpty() == false) {
+            result.setLength(result.length() - 1);
+        }
+        return result;
     }
 }
