@@ -6,7 +6,6 @@
  */
 package org.elasticsearch.xpack.core.ml.action;
 
-import org.elasticsearch.TransportVersions;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
@@ -175,20 +174,10 @@ public class InferModelAction extends ActionType<InferModelAction.Response> {
             this.update = in.readNamedWriteable(InferenceConfigUpdate.class);
             this.previouslyLicensed = in.readBoolean();
             this.inferenceTimeout = in.readTimeValue();
-            textInput = in.readOptionalStringCollectionAsList();
-            if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_8_0)) {
-                highPriority = in.readBoolean();
-            }
-            if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_12_0)) {
-                prefixType = in.readEnum(TrainedModelPrefixStrings.PrefixType.class);
-            } else {
-                prefixType = TrainedModelPrefixStrings.PrefixType.NONE;
-            }
-            if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_15_0)) {
-                chunked = in.readBoolean();
-            } else {
-                chunked = false;
-            }
+            this.textInput = in.readOptionalStringCollectionAsList();
+            this.highPriority = in.readBoolean();
+            prefixType = in.readEnum(TrainedModelPrefixStrings.PrefixType.class);
+            chunked = in.readBoolean();
         }
 
         public int numberOfDocuments() {
@@ -261,15 +250,9 @@ public class InferModelAction extends ActionType<InferModelAction.Response> {
             out.writeBoolean(previouslyLicensed);
             out.writeTimeValue(inferenceTimeout);
             out.writeOptionalStringCollection(textInput);
-            if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_8_0)) {
-                out.writeBoolean(highPriority);
-            }
-            if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_12_0)) {
-                out.writeEnum(prefixType);
-            }
-            if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_15_0)) {
-                out.writeBoolean(chunked);
-            }
+            out.writeBoolean(highPriority);
+            out.writeEnum(prefixType);
+            out.writeBoolean(chunked);
         }
 
         @Override

@@ -14,7 +14,6 @@ import org.apache.lucene.util.BitUtil;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.TransportVersion;
-import org.elasticsearch.TransportVersions;
 import org.elasticsearch.common.CheckedBiConsumer;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesArray;
@@ -72,10 +71,12 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * it means that the "barrier to entry" for adding new methods to this class is relatively low even though it is a shared class with code
  * everywhere. That being said, this class deals primarily with {@code List}s rather than Arrays. For the most part calls should adapt to
  * lists, either by storing {@code List}s internally or just converting to and from a {@code List} when calling. This comment is repeated
- * on {@link StreamInput}.
+ * on {@link StreamOutput}.
  */
 public abstract class StreamInput extends InputStream {
 
+    // required for backwards compatibility with objects that use older transport versions for persistent serialization
+    private static final TransportVersion V_8_7_0 = TransportVersion.fromId(8070099);
     private TransportVersion version = TransportVersion.current();
 
     /**
@@ -919,8 +920,12 @@ public abstract class StreamInput extends InputStream {
             case 6 -> readByteArray();
             case 7 -> readCollection(StreamInput::readGenericValue, ArrayList::new, Collections.emptyList());
             case 8 -> readArray();
-            case 9 -> readOrderedMap(StreamInput::readGenericValue, StreamInput::readGenericValue);
-            case 10 -> readMap(StreamInput::readGenericValue, StreamInput::readGenericValue);
+            case 9 -> getTransportVersion().onOrAfter(V_8_7_0)
+                ? readOrderedMap(StreamInput::readGenericValue, StreamInput::readGenericValue)
+                : readOrderedMap(StreamInput::readString, StreamInput::readGenericValue);
+            case 10 -> getTransportVersion().onOrAfter(V_8_7_0)
+                ? readMap(StreamInput::readGenericValue, StreamInput::readGenericValue)
+                : readMap(StreamInput::readGenericValue);
             case 11 -> readByte();
             case 12 -> readDate();
             case 13 ->
@@ -967,12 +972,7 @@ public abstract class StreamInput extends InputStream {
 
     private ZonedDateTime readZonedDateTime() throws IOException {
         final String timeZoneId = readString();
-        final Instant instant;
-        if (getTransportVersion().onOrAfter(TransportVersions.V_8_16_0)) {
-            instant = Instant.ofEpochSecond(readZLong(), readInt());
-        } else {
-            instant = Instant.ofEpochMilli(readLong());
-        }
+        final Instant instant = Instant.ofEpochSecond(readZLong(), readInt());
         return ZonedDateTime.ofInstant(instant, ZoneId.of(timeZoneId));
     }
 
@@ -1190,6 +1190,17 @@ public abstract class StreamInput extends InputStream {
     @Nullable
     public <T extends Exception> T readException() throws IOException {
         return ElasticsearchException.readException(this);
+    }
+
+    /**
+     * Reads an optional {@link Exception}.
+     */
+    @Nullable
+    public <T extends Exception> T readOptionalException() throws IOException {
+        if (readBoolean()) {
+            return ElasticsearchException.readException(this);
+        }
+        return null;
     }
 
     /**

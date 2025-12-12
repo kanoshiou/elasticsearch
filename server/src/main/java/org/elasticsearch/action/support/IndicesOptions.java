@@ -10,7 +10,6 @@ package org.elasticsearch.action.support;
 
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.TransportVersion;
-import org.elasticsearch.TransportVersions;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
@@ -750,6 +749,25 @@ public record IndicesOptions(
                 .allowAliasToMultipleIndices(true)
         )
         .build();
+    public static final IndicesOptions CPS_STRICT_EXPAND_OPEN_FORBID_CLOSED_IGNORE_THROTTLED = IndicesOptions.builder()
+        .concreteTargetOptions(ConcreteTargetOptions.ERROR_WHEN_UNAVAILABLE_TARGETS)
+        .wildcardOptions(
+            WildcardOptions.builder()
+                .matchOpen(true)
+                .matchClosed(false)
+                .includeHidden(false)
+                .allowEmptyExpressions(true)
+                .resolveAliases(true)
+        )
+        .gatekeeperOptions(
+            GatekeeperOptions.builder()
+                .ignoreThrottled(true)
+                .allowClosedIndices(false)
+                .allowSelectors(true)
+                .allowAliasToMultipleIndices(true)
+        )
+        .crossProjectModeOptions(new CrossProjectModeOptions(true))
+        .build();
     public static final IndicesOptions STRICT_SINGLE_INDEX_NO_EXPAND_FORBID_CLOSED = IndicesOptions.builder()
         .concreteTargetOptions(ConcreteTargetOptions.ERROR_WHEN_UNAVAILABLE_TARGETS)
         .wildcardOptions(
@@ -942,10 +960,6 @@ public record IndicesOptions(
             states.add(WildcardStates.HIDDEN);
         }
         out.writeEnumSet(states);
-        if (out.getTransportVersion().between(TransportVersions.V_8_14_0, TransportVersions.V_8_16_0)) {
-            out.writeBoolean(true);
-            out.writeBoolean(false);
-        }
         out.writeWriteable(crossProjectModeOptions);
     }
 
@@ -965,11 +979,6 @@ public record IndicesOptions(
             .includeFailureIndices(includeFailureIndices)
             .ignoreThrottled(options.contains(Option.IGNORE_THROTTLED))
             .build();
-        if (in.getTransportVersion().between(TransportVersions.V_8_14_0, TransportVersions.V_8_16_0)) {
-            // Reading from an older node, which will be sending two booleans that we must read out and ignore.
-            in.readBoolean();
-            in.readBoolean();
-        }
         return new IndicesOptions(
             options.contains(Option.ALLOW_UNAVAILABLE_CONCRETE_TARGETS)
                 ? ConcreteTargetOptions.ALLOW_UNAVAILABLE_TARGETS
@@ -1354,6 +1363,16 @@ public record IndicesOptions(
      */
     public static IndicesOptions strictExpandOpenAndForbidClosedIgnoreThrottled() {
         return STRICT_EXPAND_OPEN_FORBID_CLOSED_IGNORE_THROTTLED;
+    }
+
+    /**
+     * @return indices options that requires every specified index to exist, expands wildcards only to open indices,
+     * allows that no indices are resolved from wildcard expressions (not returning an error),
+     * forbids the use of closed indices by throwing an error and ignores indices that are throttled,
+     * and has CrossProjectModeOptions set to true.
+     */
+    public static IndicesOptions cpsStrictExpandOpenAndForbidClosedIgnoreThrottled() {
+        return CPS_STRICT_EXPAND_OPEN_FORBID_CLOSED_IGNORE_THROTTLED;
     }
 
     /**

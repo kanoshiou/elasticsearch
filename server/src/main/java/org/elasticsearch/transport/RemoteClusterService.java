@@ -65,6 +65,7 @@ public final class RemoteClusterService extends RemoteClusterAware
     private static final Logger logger = LogManager.getLogger(RemoteClusterService.class);
 
     public static final String REMOTE_CLUSTER_HANDSHAKE_ACTION_NAME = "cluster:internal/remote_cluster/handshake";
+    public static final String CONNECTION_ATTEMPT_FAILURES_COUNTER_NAME = "es.projects.linked.connections.error.total";
 
     private final boolean isRemoteClusterClient;
     private final boolean isSearchNode;
@@ -101,6 +102,9 @@ public final class RemoteClusterService extends RemoteClusterAware
          *  the functionality to do it the right way is not yet ready -- replace this code when it's ready.
          */
         this.crossProjectEnabled = settings.getAsBoolean("serverless.cross_project.enabled", false);
+        transportService.getTelemetryProvider()
+            .getMeterRegistry()
+            .registerLongCounter(CONNECTION_ATTEMPT_FAILURES_COUNTER_NAME, "linked project connection attempt failure count", "count");
     }
 
     public RemoteClusterCredentialsManager getRemoteClusterCredentialsManager() {
@@ -294,6 +298,27 @@ public final class RemoteClusterService extends RemoteClusterAware
     }
 
     @Override
+    public synchronized void remove(ProjectId originProjectId, ProjectId linkedProjectId, String linkedProjectAlias) {
+        final var connectionMap = getConnectionsMapForProject(originProjectId);
+        // Remove the entry so no new incoming requests attempt to use the connection while we are closing it.
+        final var remote = connectionMap.remove(linkedProjectAlias);
+        try {
+            IOUtils.close(remote);
+        } catch (IOException e) {
+            logger.warn(
+                "project [" + originProjectId + "] failed to close remote cluster connections for cluster: " + linkedProjectAlias,
+                e
+            );
+        }
+        logger.info(
+            "project [{}] remote cluster connection [{}] removed: {}",
+            originProjectId,
+            linkedProjectAlias,
+            RemoteClusterConnectionStatus.DISCONNECTED
+        );
+    }
+
+    @Override
     public void updateLinkedProject(LinkedProjectConfig config) {
         final var projectId = config.originProjectId();
         final var clusterAlias = config.linkedProjectAlias();
@@ -306,7 +331,7 @@ public final class RemoteClusterService extends RemoteClusterAware
 
             @Override
             public void onFailure(Exception e) {
-                logger.warn(() -> "project [" + projectId + " failed to update remote cluster connection [" + clusterAlias + "]", e);
+                logger.warn(() -> "project [" + projectId + "] failed to update remote cluster connection [" + clusterAlias + "]", e);
             }
         }, latch::countDown));
 
@@ -343,16 +368,6 @@ public final class RemoteClusterService extends RemoteClusterAware
         final var clusterAlias = config.linkedProjectAlias();
         final var connectionMap = getConnectionsMapForProject(projectId);
         RemoteClusterConnection remote = connectionMap.get(clusterAlias);
-        if (config.isConnectionEnabled() == false) {
-            try {
-                IOUtils.close(remote);
-            } catch (IOException e) {
-                logger.warn("project [" + projectId + "] failed to close remote cluster connections for cluster: " + clusterAlias, e);
-            }
-            connectionMap.remove(clusterAlias);
-            listener.onResponse(RemoteClusterConnectionStatus.DISCONNECTED);
-            return;
-        }
 
         if (remote == null) {
             // this is a new cluster we have to add a new representation

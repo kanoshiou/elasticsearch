@@ -14,7 +14,6 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefBuilder;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.TransportVersion;
-import org.elasticsearch.TransportVersions;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
@@ -65,6 +64,8 @@ import static java.util.Map.entry;
  */
 public abstract class StreamOutput extends OutputStream {
 
+    // required for backwards compatibility with objects that use older transport versions for persistent serialization
+    private static final TransportVersion V_8_7_0 = TransportVersion.fromId(8070099);
     private TransportVersion version = TransportVersion.current();
 
     /**
@@ -613,7 +614,11 @@ public abstract class StreamOutput extends OutputStream {
         Iterator<? extends Map.Entry<String, ?>> iterator = map.entrySet().stream().sorted(Map.Entry.comparingByKey()).iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, ?> next = iterator.next();
-            this.writeGenericValue(next.getKey());
+            if (this.getTransportVersion().onOrAfter(V_8_7_0)) {
+                this.writeGenericValue(next.getKey());
+            } else {
+                this.writeString(next.getKey());
+            }
             this.writeGenericValue(next.getValue());
         }
     }
@@ -747,8 +752,14 @@ public abstract class StreamOutput extends OutputStream {
             } else {
                 o.writeByte((byte) 10);
             }
-            final Map<?, ?> map = (Map<?, ?>) v;
-            o.writeMap(map, StreamOutput::writeGenericValue, StreamOutput::writeGenericValue);
+            if (o.getTransportVersion().onOrAfter(V_8_7_0)) {
+                final Map<?, ?> map = (Map<?, ?>) v;
+                o.writeMap(map, StreamOutput::writeGenericValue, StreamOutput::writeGenericValue);
+            } else {
+                @SuppressWarnings("unchecked")
+                final Map<String, ?> map = (Map<String, ?>) v;
+                o.writeMap(map, StreamOutput::writeGenericValue);
+            }
         }),
         entry(Byte.class, (o, v) -> {
             o.writeByte((byte) 11);
@@ -799,12 +810,8 @@ public abstract class StreamOutput extends OutputStream {
             final ZonedDateTime zonedDateTime = (ZonedDateTime) v;
             o.writeString(zonedDateTime.getZone().getId());
             Instant instant = zonedDateTime.toInstant();
-            if (o.getTransportVersion().onOrAfter(TransportVersions.V_8_16_0)) {
-                o.writeZLong(instant.getEpochSecond());
-                o.writeInt(instant.getNano());
-            } else {
-                o.writeLong(instant.toEpochMilli());
-            }
+            o.writeZLong(instant.getEpochSecond());
+            o.writeInt(instant.getNano());
         }),
         entry(Set.class, (o, v) -> {
             if (v instanceof LinkedHashSet) {
@@ -1079,6 +1086,18 @@ public abstract class StreamOutput extends OutputStream {
 
     public void writeException(Throwable throwable) throws IOException {
         ElasticsearchException.writeException(throwable, this);
+    }
+
+    /**
+     * Write an optional {@link Throwable} to the stream.
+     */
+    public void writeOptionalException(@Nullable Throwable throwable) throws IOException {
+        if (throwable == null) {
+            writeBoolean(false);
+        } else {
+            writeBoolean(true);
+            writeException(throwable);
+        }
     }
 
     /**
