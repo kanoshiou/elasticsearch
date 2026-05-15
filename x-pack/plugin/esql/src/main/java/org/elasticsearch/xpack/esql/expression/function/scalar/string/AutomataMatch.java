@@ -9,14 +9,19 @@ package org.elasticsearch.xpack.esql.expression.function.scalar.string;
 
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.Automaton;
+import java.util.function.Function;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
 import org.apache.lucene.util.automaton.Operations;
+import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
 import org.apache.lucene.util.automaton.Transition;
 import org.apache.lucene.util.automaton.UTF32ToUTF8;
+import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.compute.ann.Evaluator;
 import org.elasticsearch.compute.ann.Fixed;
 import org.elasticsearch.compute.data.BooleanBlock;
-import org.elasticsearch.compute.operator.EvalOperator;
+import org.elasticsearch.compute.expression.ExpressionEvaluator;
+import org.elasticsearch.compute.operator.DriverContext;
+import org.elasticsearch.lucene.util.automaton.CircuitBreakingOperations;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 
 /**
@@ -24,21 +29,63 @@ import org.elasticsearch.xpack.esql.core.tree.Source;
  */
 public class AutomataMatch {
     /**
-     * Build an {@link EvalOperator.ExpressionEvaluator.Factory} that will match
+     * Build an {@link ExpressionEvaluator.Factory} that will match
      * {@link BytesRef}s against {@link Automaton automata} and return a {@link BooleanBlock}.
+     * <p>
+     * Automaton determinization and {@link ByteRunAutomaton} construction are deferred to
+     * {@link ExpressionEvaluator.Factory#get(DriverContext)} time so that a {@link CircuitBreaker}
+     * is available to guard against pathological patterns that could OOM the JVM.
      */
-    public static EvalOperator.ExpressionEvaluator.Factory toEvaluator(
+    public static ExpressionEvaluator.Factory toEvaluator(Source source, ExpressionEvaluator.Factory field, Automaton utf32Automaton) {
+        return toEvaluator(source, field, breaker -> utf32Automaton);
+    }
+
+    /**
+     * Build an {@link ExpressionEvaluator.Factory} that will match
+     * {@link BytesRef}s against {@link Automaton automata} and return a {@link BooleanBlock}.
+     * <p>
+     * The automaton is created lazily at {@link ExpressionEvaluator.Factory#get(DriverContext)} time
+     * via the supplied {@code automatonFactory}, so that a {@link CircuitBreaker} is available to
+     * guard against pathological patterns that could OOM the JVM.
+     */
+    public static ExpressionEvaluator.Factory toEvaluator(
         Source source,
-        EvalOperator.ExpressionEvaluator.Factory field,
-        Automaton utf32Automaton
+        ExpressionEvaluator.Factory field,
+        Function<CircuitBreaker, Automaton> automatonFactory
     ) {
-        /*
-         * ByteRunAutomaton has a way to convert utf32 to utf8, but if we used it
-         * we couldn't get a nice toDot - so we call UTF32ToUTF8 ourselves.
-         */
-        Automaton automaton = Operations.determinize(new UTF32ToUTF8().convert(utf32Automaton), Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
-        ByteRunAutomaton run = new ByteRunAutomaton(automaton, true, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
-        return new AutomataMatchEvaluator.Factory(source, field, run, toDot(automaton));
+        return new ExpressionEvaluator.Factory() {
+            @Override
+            public ExpressionEvaluator get(DriverContext context) {
+                /*
+                 * ByteRunAutomaton has a way to convert utf32 to utf8, but if we used it
+                 * we couldn't get a nice toDot - so we call UTF32ToUTF8 ourselves.
+                 */
+                CircuitBreaker breaker = context.breaker();
+                Automaton utf32Automaton = automatonFactory.apply(breaker);
+                Automaton automaton;
+                try {
+                    automaton = CircuitBreakingOperations.determinize(
+                        new UTF32ToUTF8().convert(utf32Automaton),
+                        Operations.DEFAULT_DETERMINIZE_WORK_LIMIT,
+                        breaker,
+                        "esql-like-rlike"
+                    );
+                } catch (TooComplexToDeterminizeException e) {
+                    throw new IllegalArgumentException("Pattern was too complex to determinize", e);
+                }
+
+                ByteRunAutomaton run = new ByteRunAutomaton(automaton, true);
+                if (breaker != null) {
+                    breaker.addEstimateBytesAndMaybeBreak(run.ramBytesUsed(), "esql-like-rlike-automaton");
+                }
+                return new AutomataMatchEvaluator(source, field.get(context), run, toDot(automaton), context);
+            }
+
+            @Override
+            public String toString() {
+                return "AutomataMatchEvaluator[input=" + field + ", automatonFactory=" + automatonFactory + "]";
+            }
+        };
     }
 
     @Evaluator
